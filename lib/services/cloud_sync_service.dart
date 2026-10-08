@@ -1,59 +1,67 @@
 import 'dart:convert';
-import 'package:flutter/services.dart' show rootBundle;
-import 'package:http/http.dart' as http;
+import 'package:flutter/services.dart';
 import 'package:drift/drift.dart';
 import '../data/database/app_database.dart';
 
 class CloudSyncService {
   final AppDatabase db;
-  static const String remoteUrl =
-      'https://raw.githubusercontent.com/mrabe9674-dotcom/draft_dominator/main/assets/data/players.json';
-
   CloudSyncService(this.db);
 
   Future<void> syncData() async {
-    String rawData;
-    try {
-      // Append millisecond timestamp to bypass GitHub's raw CDN caching
-      final cacheBusterUrl =
-          '$remoteUrl?t=${DateTime.now().millisecondsSinceEpoch}';
-      final res = await http
-          .get(Uri.parse(cacheBusterUrl))
-          .timeout(const Duration(seconds: 4));
+    final String rawJson =
+        await rootBundle.loadString('assets/data/players.json');
+    final List<dynamic> list = jsonDecode(rawJson) as List<dynamic>;
 
-      if (res.statusCode == 200) {
-        rawData = res.body;
-      } else {
-        throw Exception('Server returned status ${res.statusCode}');
+    await db.batch((batch) {
+      for (final item in list) {
+        final map = item as Map<String, dynamic>;
+        batch.insert(
+          db.players,
+          PlayersCompanion(
+            id: map['id'] != null
+                ? Value((map['id'] as num).toInt())
+                : const Value.absent(),
+            name: Value(map['name'] as String? ?? 'Unknown Player'),
+            position: Value(map['position'] as String? ?? 'N/A'),
+            nflTeam: Value(map['nflTeam'] as String? ?? 'FA'),
+            age: Value((map['age'] as num?)?.toInt() ?? 25),
+            adp: Value((map['adp'] as num?)?.toDouble() ?? 999.0),
+            injuryRisk: Value((map['injuryRisk'] as num?)?.toDouble() ?? 0.0),
+            crimeRisk: Value((map['crimeRisk'] as num?)?.toDouble() ?? 0.0),
+            teamTalentScore:
+                Value((map['teamTalentScore'] as num?)?.toDouble() ?? 1.0),
+            projPassYds:
+                Value((map['projPassYds'] as num?)?.toDouble() ?? 0.0),
+            projPassTds:
+                Value((map['projPassTds'] as num?)?.toDouble() ?? 0.0),
+            projPassInts:
+                Value((map['projPassInts'] as num?)?.toDouble() ?? 0.0),
+            projRushYds:
+                Value((map['projRushYds'] as num?)?.toDouble() ?? 0.0),
+            projRushTds:
+                Value((map['projRushTds'] as num?)?.toDouble() ?? 0.0),
+            projRec: Value((map['projRec'] as num?)?.toDouble() ?? 0.0),
+            projRecYds: Value((map['projRecYds'] as num?)?.toDouble() ?? 0.0),
+            projRecTds: Value((map['projRecTds'] as num?)?.toDouble() ?? 0.0),
+            projFgMade: Value((map['projFgMade'] as num?)?.toDouble() ?? 0.0),
+            projFg50Plus:
+                Value((map['projFg50Plus'] as num?)?.toDouble() ?? 0.0),
+            projPatMade:
+                Value((map['projPatMade'] as num?)?.toDouble() ?? 0.0),
+            projSacks: Value((map['projSacks'] as num?)?.toDouble() ?? 0.0),
+            projTakeaways:
+                Value((map['projTakeaways'] as num?)?.toDouble() ?? 0.0),
+            projDefTds: Value((map['projDefTds'] as num?)?.toDouble() ?? 0.0),
+            projPtsAllowedBaseline:
+                Value((map['projPtsAllowedBaseline'] as num?)?.toDouble() ?? 0.0),
+            priorYearPts:
+                Value((map['priorYearPts'] as num?)?.toDouble() ?? 0.0),
+            priorYearSummary:
+                Value(map['priorYearSummary'] as String? ?? ''),
+          ),
+          mode: InsertMode.insertOrReplace,
+        );
       }
-    } catch (_) {
-      rawData = await rootBundle.loadString('assets/data/players.json');
-    }
-
-    final List<dynamic> list = jsonDecode(rawData);
-    final companions = list.map((item) {
-      final m = item as Map<String, dynamic>;
-      return PlayersCompanion.insert(
-        name: m['name'] as String,
-        position: m['position'] as String,
-        nflTeam: m['nflTeam'] as String,
-        age: (m['age'] as num).toInt(),
-        injuryRisk: Value((m['injuryRisk'] as num? ?? 0.0).toDouble()),
-        crimeRisk: Value((m['crimeRisk'] as num? ?? 0.0).toDouble()),
-        teamTalentScore: Value((m['teamTalentScore'] as num? ?? 1.0).toDouble()),
-        projPassYds: Value((m['projPassYds'] as num? ?? 0.0).toDouble()),
-        projPassTds: Value((m['projPassTds'] as num? ?? 0.0).toDouble()),
-        projRushYds: Value((m['projRushYds'] as num? ?? 0.0).toDouble()),
-        projRushTds: Value((m['projRushTds'] as num? ?? 0.0).toDouble()),
-        projRec: Value((m['projRec'] as num? ?? 0.0).toDouble()),
-        projRecYds: Value((m['projRecYds'] as num? ?? 0.0).toDouble()),
-        projRecTds: Value((m['projRecTds'] as num? ?? 0.0).toDouble()),
-      );
-    }).toList();
-
-    await db.delete(db.players).go();
-    await db.batch((b) {
-      b.insertAll(db.players, companions);
     });
   }
 }

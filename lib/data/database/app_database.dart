@@ -20,6 +20,7 @@ class Players extends Table {
   RealColumn get injuryRisk => real().withDefault(const Constant(0.0))();
   RealColumn get crimeRisk => real().withDefault(const Constant(0.0))();
   RealColumn get teamTalentScore => real().withDefault(const Constant(1.0))();
+  RealColumn get adp => real().withDefault(const Constant(999.0))();
 
   // Passing / Rushing / Receiving (Skill positions)
   RealColumn get projPassYds => real().withDefault(const Constant(0.0))();
@@ -52,7 +53,7 @@ class AppDatabase extends _$AppDatabase {
   AppDatabase() : super(_openConnection());
 
   @override
-  int get schemaVersion => 3;
+  int get schemaVersion => 4;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
