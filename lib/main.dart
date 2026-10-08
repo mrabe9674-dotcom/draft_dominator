@@ -1,3 +1,4 @@
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'data/database/app_database.dart';
 import 'services/cloud_sync_service.dart';
@@ -5,17 +6,20 @@ import 'services/cloud_sync_service.dart';
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   final db = AppDatabase();
-  runApp(DraftDominatorApp(db: db));
+  runApp(OnTheClockApp(db: db));
 }
 
-class DraftDominatorApp extends StatelessWidget {
+// Compatibility alias so any lingering references never throw an error
+typedef DraftDominatorApp = OnTheClockApp;
+
+class OnTheClockApp extends StatelessWidget {
   final AppDatabase db;
-  const DraftDominatorApp({super.key, required this.db});
+  const OnTheClockApp({super.key, required this.db});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Draft Dominator',
+      title: 'On The Clock - Fantasy Football Draft Tool',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         brightness: Brightness.dark,
@@ -30,12 +34,54 @@ class DraftDominatorApp extends StatelessWidget {
   }
 }
 
+enum DraftType { snake, linear }
+enum SortMetric { vorp, vona, projPoints, priorYear }
+
+class KeeperSelection {
+  final Player player;
+  final int teamIndex;
+  final int forfeitRound;
+
+  KeeperSelection({
+    required this.player,
+    required this.teamIndex,
+    required this.forfeitRound,
+  });
+
+  String getTeamName(LeagueSettings settings) => settings.teamNames[teamIndex];
+
+  int getRoundPick(LeagueSettings settings) =>
+      settings.getRoundPickForTeam(teamIndex, forfeitRound);
+
+  int getOverallPick(LeagueSettings settings) =>
+      settings.calculateOverallPick(forfeitRound, getRoundPick(settings));
+}
+
 class LeagueSettings {
   String leagueName;
   int numTeams;
   int numRounds;
   List<String> teamNames;
   int myTeamIndex;
+  DraftType draftType;
+  List<int> draftOrder;
+
+  // Starting Lineup Requirements
+  int startQb;
+  int startRb;
+  int startWr;
+  int startTe;
+  int startFlex;
+  int startK;
+  int startDst;
+
+  // Positional Draft Quotas
+  int minQb;
+  int minRb;
+  int minWr;
+  int minTe;
+  int minK;
+  int minDst;
 
   // Passing Scoring
   double passTdPoints;
@@ -95,6 +141,21 @@ class LeagueSettings {
     this.numRounds = 16,
     List<String>? teamNames,
     this.myTeamIndex = 0,
+    this.draftType = DraftType.snake,
+    List<int>? draftOrder,
+    this.startQb = 1,
+    this.startRb = 2,
+    this.startWr = 2,
+    this.startTe = 1,
+    this.startFlex = 1,
+    this.startK = 1,
+    this.startDst = 1,
+    this.minQb = 2,
+    this.minRb = 4,
+    this.minWr = 4,
+    this.minTe = 2,
+    this.minK = 1,
+    this.minDst = 1,
     this.passTdPoints = 4.0,
     this.passTd50PlusBonus = 3.0,
     this.passTd75PlusBonus = 6.0,
@@ -137,11 +198,43 @@ class LeagueSettings {
     this.pa4to6Points = 6.0,
     this.pa7to9Points = 4.0,
     this.pa10to12Points = 2.0,
-  }) : teamNames = teamNames ??
+  })  : teamNames = teamNames ??
             List.generate(
               16,
-              (i) => i == 0 ? 'My Dominators' : 'Team ${i + 1}',
-            );
+              (i) => i == 0 ? 'My Roster' : 'Team ${i + 1}',
+            ),
+        draftOrder = draftOrder ?? List.generate(16, (i) => i);
+
+  int get totalStarters =>
+      startQb + startRb + startWr + startTe + startFlex + startK + startDst;
+
+  int get totalQuotas => minQb + minRb + minWr + minTe + minK + minDst;
+
+  int getTeamIndexForPick(int overallPick) {
+    if (numTeams == 0) return 0;
+    final int pick0 = overallPick - 1;
+    final int round0 = pick0 ~/ numTeams;
+    final int roundPick0 = pick0 % numTeams;
+
+    if (draftType == DraftType.snake && (round0 % 2 == 1)) {
+      final int reversedSlot = (numTeams - 1) - roundPick0;
+      return draftOrder[reversedSlot];
+    }
+    return draftOrder[roundPick0];
+  }
+
+  int getRoundPickForTeam(int teamIdx, int round) {
+    final int slot0 = draftOrder.indexOf(teamIdx);
+    if (slot0 == -1) return 1;
+    if (draftType == DraftType.snake && (round % 2 == 0)) {
+      return numTeams - slot0;
+    }
+    return slot0 + 1;
+  }
+
+  int calculateOverallPick(int round, int roundPick) {
+    return ((round - 1) * numTeams) + roundPick;
+  }
 }
 
 class DraftPickRecord {
@@ -149,12 +242,14 @@ class DraftPickRecord {
   final Player player;
   final String draftedByTeam;
   final bool isMyTeam;
+  final bool isKeeper;
 
   DraftPickRecord({
     required this.pickNumber,
     required this.player,
     required this.draftedByTeam,
     required this.isMyTeam,
+    this.isKeeper = false,
   });
 }
 
@@ -183,8 +278,15 @@ class DraftBoardPage extends StatefulWidget {
 class _DraftBoardPageState extends State<DraftBoardPage> {
   late final CloudSyncService _syncService;
   final List<DraftPickRecord> _draftHistory = [];
+  final List<KeeperSelection> _keepers = [];
+  final Set<int> _targetPlayerIds = {};
+  final Set<int> _fadePlayerIds = {};
+
   final LeagueSettings _settings = LeagueSettings();
   String _selectedPosition = 'ALL';
+  SortMetric _selectedSort = SortMetric.vorp;
+  bool _filterTargetsOnly = false;
+  bool _hideFadedPlayers = false;
   bool _isLoading = false;
 
   @override
@@ -218,7 +320,35 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
 
   String get _myTeamName => _settings.teamNames[_settings.myTeamIndex];
 
-  void _recordPick(Player player, String teamName) {
+  int get _currentPickNumber => _draftHistory.length + 1;
+  int get _currentRound => ((_currentPickNumber - 1) ~/ _settings.numTeams) + 1;
+  int get _currentRoundPick => ((_currentPickNumber - 1) % _settings.numTeams) + 1;
+  bool get _isDraftComplete => _draftHistory.length >= (_settings.numTeams * _settings.numRounds);
+
+  String get _onTheClockTeamName {
+    if (_isDraftComplete) return 'Draft Complete';
+    final int teamIdx = _settings.getTeamIndexForPick(_currentPickNumber);
+    return _settings.teamNames[teamIdx];
+  }
+
+  bool get _isMyTurn {
+    if (_isDraftComplete) return false;
+    final int teamIdx = _settings.getTeamIndexForPick(_currentPickNumber);
+    return teamIdx == _settings.myTeamIndex;
+  }
+
+  void _checkAndTriggerKeeper() {
+    if (_isDraftComplete) return;
+    final match = _keepers
+        .where((k) => k.getOverallPick(_settings) == _currentPickNumber)
+        .toList();
+    if (match.isNotEmpty) {
+      final keeper = match.first;
+      _recordPick(keeper.player, keeper.getTeamName(_settings), isKeeper: true);
+    }
+  }
+
+  void _recordPick(Player player, String teamName, {bool isKeeper = false}) {
     setState(() {
       _draftHistory.add(
         DraftPickRecord(
@@ -226,9 +356,11 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
           player: player,
           draftedByTeam: teamName,
           isMyTeam: teamName == _myTeamName,
+          isKeeper: isKeeper,
         ),
       );
     });
+    WidgetsBinding.instance.addPostFrameCallback((_) => _checkAndTriggerKeeper());
   }
 
   void _undoToPick(int targetPickNumber) {
@@ -241,6 +373,7 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
     setState(() {
       _draftHistory.clear();
     });
+    WidgetsBinding.instance.addPostFrameCallback((_) => _checkAndTriggerKeeper());
   }
 
   double _calculateFantasyPoints(Player p) {
@@ -297,6 +430,41 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
     return total * injuryMultiplier * p.teamTalentScore;
   }
 
+  double _getQuotaScarcityMultiplier(String pos) {
+    int draftedCount = _myRoster.where((p) => p.position == pos).length;
+    int targetMin = 0;
+    switch (pos) {
+      case 'QB':
+        targetMin = _settings.minQb;
+        break;
+      case 'RB':
+        targetMin = _settings.minRb;
+        break;
+      case 'WR':
+        targetMin = _settings.minWr;
+        break;
+      case 'TE':
+        targetMin = _settings.minTe;
+        break;
+      case 'K':
+        targetMin = _settings.minK;
+        break;
+      case 'DST':
+        targetMin = _settings.minDst;
+        break;
+    }
+
+    if (targetMin <= 0) return 1.0;
+    int remainingNeeded = targetMin - draftedCount;
+    if (remainingNeeded <= 0) return 0.95;
+
+    int remainingRounds = _settings.numRounds - _draftHistory.where((p) => p.isMyTeam).length;
+    if (remainingRounds <= 0) remainingRounds = 1;
+
+    double pressure = remainingNeeded / remainingRounds;
+    return 1.0 + (pressure * 0.4).clamp(0.0, 0.6);
+  }
+
   Color _getTierCliffColor(double vona) {
     if (vona >= 20.0) return const Color(0xFFFF5252);
     if (vona >= 8.0) return const Color(0xFFFFB74D);
@@ -322,50 +490,266 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
     }
   }
 
+  void _showKeepersDialog(List<Player> allPlayers) {
+    int selectedTeamIdx = 0;
+    int forfeitRound = 1;
+    Player? chosenPlayer;
+
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          final availablePlayers = allPlayers
+              .where((p) => !_keepers.any((k) => k.player.id == p.id))
+              .toList();
+          chosenPlayer ??= availablePlayers.isNotEmpty ? availablePlayers.first : null;
+
+          final lockedRoundPick = _settings.getRoundPickForTeam(selectedTeamIdx, forfeitRound);
+          final lockedOverallPick = _settings.calculateOverallPick(forfeitRound, lockedRoundPick);
+
+          return AlertDialog(
+            backgroundColor: const Color(0xFF1E1716),
+            title: const Row(
+              children: [
+                Icon(Icons.bookmark_added, color: Colors.amberAccent),
+                SizedBox(width: 8),
+                Text('Manage Pre-Draft Keepers'),
+              ],
+            ),
+            content: SizedBox(
+              width: 600,
+              height: 500,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF2C2220),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: Colors.white12),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Add Keeper & Auto-Locked Forfeited Slot:',
+                          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.amberAccent),
+                        ),
+                        const SizedBox(height: 8),
+                        Row(
+                          children: [
+                            Expanded(
+                              flex: 2,
+                              child: DropdownButtonFormField<int>(
+                                initialValue: selectedTeamIdx,
+                                decoration: const InputDecoration(labelText: 'Team', isDense: true),
+                                dropdownColor: const Color(0xFF2C2220),
+                                items: List.generate(_settings.numTeams, (i) {
+                                  return DropdownMenuItem(value: i, child: Text(_settings.teamNames[i]));
+                                }),
+                                onChanged: (v) {
+                                  if (v != null) setDialogState(() => selectedTeamIdx = v);
+                                },
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              flex: 3,
+                              child: DropdownButtonFormField<Player>(
+                                initialValue: chosenPlayer,
+                                decoration: const InputDecoration(labelText: 'Player Kept', isDense: true),
+                                dropdownColor: const Color(0xFF2C2220),
+                                items: availablePlayers.map((p) {
+                                  return DropdownMenuItem(value: p, child: Text('${p.name} (${p.position})'));
+                                }).toList(),
+                                onChanged: (v) {
+                                  if (v != null) setDialogState(() => chosenPlayer = v);
+                                },
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 10),
+                        Row(
+                          children: [
+                            Expanded(
+                              flex: 2,
+                              child: DropdownButtonFormField<int>(
+                                initialValue: forfeitRound,
+                                decoration: const InputDecoration(labelText: 'Forfeit Round', isDense: true),
+                                dropdownColor: const Color(0xFF2C2220),
+                                items: List.generate(_settings.numRounds, (i) => i + 1).map((r) {
+                                  return DropdownMenuItem(value: r, child: Text('Round $r'));
+                                }).toList(),
+                                onChanged: (v) {
+                                  if (v != null) setDialogState(() => forfeitRound = v);
+                                },
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              flex: 3,
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFF140D0C),
+                                  borderRadius: BorderRadius.circular(6),
+                                  border: Border.all(color: Colors.white24),
+                                ),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    const Text('Locked Pick Slot', style: TextStyle(fontSize: 10, color: Colors.white54)),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      'Pick #$lockedRoundPick (Overall #$lockedOverallPick)',
+                                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.greenAccent),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            ElevatedButton.icon(
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: const Color(0xFF6750A4),
+                                foregroundColor: Colors.white,
+                                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+                              ),
+                              icon: const Icon(Icons.add, size: 16),
+                              label: const Text('Assign'),
+                              onPressed: chosenPlayer == null
+                                  ? null
+                                  : () {
+                                      setState(() {
+                                        _keepers.add(KeeperSelection(
+                                          player: chosenPlayer!,
+                                          teamIndex: selectedTeamIdx,
+                                          forfeitRound: forfeitRound,
+                                        ));
+                                      });
+                                      setDialogState(() {
+                                        chosenPlayer = null;
+                                      });
+                                    },
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  const Text('Active Pre-Draft Keepers:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                  const SizedBox(height: 6),
+                  Expanded(
+                    child: _keepers.isEmpty
+                        ? const Center(child: Text('No keepers assigned yet.', style: TextStyle(color: Colors.white54)))
+                        : ListView.separated(
+                            itemCount: _keepers.length,
+                            separatorBuilder: (_, __) => const Divider(height: 1, color: Colors.white12),
+                            itemBuilder: (context, idx) {
+                              final k = _keepers[idx];
+                              final roundPick = k.getRoundPick(_settings);
+                              final overallPick = k.getOverallPick(_settings);
+
+                              return ListTile(
+                                dense: true,
+                                leading: CircleAvatar(
+                                  radius: 14,
+                                  backgroundColor: _getPositionBadgeColor(k.player.position),
+                                  child: Text(k.player.position, style: const TextStyle(fontSize: 10, color: Colors.white)),
+                                ),
+                                title: Text('${k.player.name} → ${k.getTeamName(_settings)}', style: const TextStyle(fontWeight: FontWeight.bold)),
+                                subtitle: Text(
+                                  'Forfeits Round ${k.forfeitRound}, Pick #$roundPick (Overall #$overallPick)',
+                                  style: const TextStyle(color: Colors.white70, fontSize: 11),
+                                ),
+                                trailing: IconButton(
+                                  icon: const Icon(Icons.delete_outline, color: Colors.redAccent, size: 18),
+                                  onPressed: () {
+                                    setDialogState(() {
+                                      setState(() {
+                                        _keepers.removeAt(idx);
+                                      });
+                                    });
+                                  },
+                                ),
+                              );
+                            },
+                          ),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Close'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
   void _showDraftSelectionDialog(Player player) {
+    final defaultTeam = _isDraftComplete ? _myTeamName : _onTheClockTeamName;
+
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: const Color(0xFF1E1716),
         title: Text('Draft ${player.name} (${player.position})'),
         content: SizedBox(
-          width: 420,
+          width: 440,
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                'Pick #${_draftHistory.length + 1} - Select drafting team:',
+                'Pick #$_currentPickNumber (Round $_currentRound, Pick $_currentRoundPick)',
+                style: const TextStyle(color: Colors.amberAccent, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                'On The Clock: $defaultTeam',
                 style: const TextStyle(color: Colors.white70),
               ),
-              const SizedBox(height: 12),
+              const Divider(color: Colors.white24, height: 20),
+              const Text('Confirm or override drafting team:', style: TextStyle(fontSize: 12, color: Colors.white60)),
+              const SizedBox(height: 8),
               SizedBox(
-                height: 250,
+                height: 240,
                 child: ListView.separated(
                   shrinkWrap: true,
                   itemCount: _settings.numTeams,
                   separatorBuilder: (_, __) => const Divider(height: 1, color: Colors.white10),
                   itemBuilder: (context, idx) {
                     final tName = _settings.teamNames[idx];
+                    final isOtC = tName == defaultTeam;
                     final isMine = idx == _settings.myTeamIndex;
 
                     return ListTile(
                       dense: true,
+                      tileColor: isOtC ? const Color(0xFF6750A4).withValues(alpha: 0.18) : null,
                       leading: Icon(
-                        isMine ? Icons.star : Icons.shield_outlined,
-                        color: isMine ? Colors.amber : Colors.white60,
+                        isMine ? Icons.star : (isOtC ? Icons.alarm : Icons.shield_outlined),
+                        color: isMine ? Colors.amber : (isOtC ? Colors.purpleAccent : Colors.white60),
                         size: 20,
                       ),
                       title: Text(
                         tName,
                         style: TextStyle(
-                          color: isMine ? Colors.amberAccent : Colors.white,
-                          fontWeight: isMine ? FontWeight.bold : FontWeight.normal,
+                          color: isOtC ? Colors.amberAccent : Colors.white,
+                          fontWeight: isOtC ? FontWeight.bold : FontWeight.normal,
                         ),
                       ),
-                      subtitle: isMine
-                          ? const Text('My Team', style: TextStyle(color: Colors.white54, fontSize: 11))
-                          : null,
+                      subtitle: isOtC
+                          ? const Text('On The Clock', style: TextStyle(color: Colors.purpleAccent, fontSize: 11))
+                          : (isMine ? const Text('My Team', style: TextStyle(color: Colors.white54, fontSize: 11)) : null),
+                      trailing: isOtC ? const Icon(Icons.check_circle, color: Colors.amberAccent, size: 18) : null,
                       onTap: () {
                         Navigator.pop(ctx);
                         _recordPick(player, tName);
@@ -382,7 +766,142 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
             onPressed: () => Navigator.pop(ctx),
             child: const Text('Cancel', style: TextStyle(color: Colors.white60)),
           ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF6750A4),
+              foregroundColor: Colors.white,
+            ),
+            onPressed: () {
+              Navigator.pop(ctx);
+              _recordPick(player, defaultTeam);
+            },
+            child: Text('Draft to $defaultTeam'),
+          ),
         ],
+      ),
+    );
+  }
+
+  void _showAllTeamsRostersDialog() {
+    int activeViewerTeamIdx = _settings.myTeamIndex;
+
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          final currentTeamName = _settings.teamNames[activeViewerTeamIdx];
+          final teamPicks = _draftHistory.where((p) => p.draftedByTeam == currentTeamName).map((p) => p.player).toList();
+
+          return AlertDialog(
+            backgroundColor: const Color(0xFF1E1716),
+            title: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text('League Rosters Viewer'),
+                DropdownButton<int>(
+                  value: activeViewerTeamIdx,
+                  dropdownColor: const Color(0xFF2C2220),
+                  items: List.generate(_settings.numTeams, (i) {
+                    final tName = _settings.teamNames[i];
+                    return DropdownMenuItem(
+                      value: i,
+                      child: Text(
+                        i == _settings.myTeamIndex ? '$tName (My Team)' : tName,
+                        style: TextStyle(
+                          color: i == _settings.myTeamIndex ? Colors.amberAccent : Colors.white,
+                          fontSize: 13,
+                        ),
+                      ),
+                    );
+                  }),
+                  onChanged: (v) {
+                    if (v != null) setDialogState(() => activeViewerTeamIdx = v);
+                  },
+                ),
+              ],
+            ),
+            content: SizedBox(
+              width: 540,
+              height: 480,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(10.0),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF2C2220),
+                      borderRadius: BorderRadius.circular(6.0),
+                    ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text(currentTeamName, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                        Text(
+                          '${teamPicks.length} / ${_settings.numRounds} Players Drafted',
+                          style: const TextStyle(color: Colors.white70, fontSize: 12),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Expanded(
+                    child: ListView(
+                      children: ['QB', 'RB', 'WR', 'TE', 'K', 'DST'].map((pos) {
+                        final posPlayers = teamPicks.where((p) => p.position == pos).toList();
+                        return Card(
+                          color: const Color(0xFF140D0C),
+                          margin: const EdgeInsets.symmetric(vertical: 4.0),
+                          child: Padding(
+                            padding: const EdgeInsets.all(8.0),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                  children: [
+                                    Text('$pos (${posPlayers.length})',
+                                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                                    CircleAvatar(
+                                      radius: 8,
+                                      backgroundColor: _getPositionBadgeColor(pos),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 6),
+                                if (posPlayers.isEmpty)
+                                  const Text('None', style: TextStyle(color: Colors.white38, fontSize: 11, fontStyle: FontStyle.italic))
+                                else
+                                  Wrap(
+                                    spacing: 6.0,
+                                    runSpacing: 4.0,
+                                    children: posPlayers.map((p) {
+                                      return Chip(
+                                        backgroundColor: _getPositionBadgeColor(pos).withValues(alpha: 0.25),
+                                        label: Text(
+                                          '${p.name} (${p.nflTeam})',
+                                          style: const TextStyle(fontSize: 11, color: Colors.white),
+                                        ),
+                                      );
+                                    }).toList(),
+                                  ),
+                              ],
+                            ),
+                          ),
+                        );
+                      }).toList(),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Close'),
+              ),
+            ],
+          );
+        },
       ),
     );
   }
@@ -429,7 +948,7 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                         ),
                       ),
                       title: Text(
-                        '${pick.player.name} (${pick.player.position} - ${pick.player.nflTeam})',
+                        '${pick.player.name} (${pick.player.position} - ${pick.player.nflTeam})${pick.isKeeper ? " [KEEPER]" : ""}',
                         style: const TextStyle(fontWeight: FontWeight.bold),
                       ),
                       subtitle: Text(
@@ -475,6 +994,24 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
     int tempTeams = _settings.numTeams;
     int tempRounds = _settings.numRounds;
     int tempMyTeamIndex = _settings.myTeamIndex;
+    DraftType tempDraftType = _settings.draftType;
+    List<int> tempDraftOrder = List<int>.from(_settings.draftOrder);
+
+    // Roster Requirements Controllers
+    final startQbCtrl = TextEditingController(text: _settings.startQb.toString());
+    final startRbCtrl = TextEditingController(text: _settings.startRb.toString());
+    final startWrCtrl = TextEditingController(text: _settings.startWr.toString());
+    final startTeCtrl = TextEditingController(text: _settings.startTe.toString());
+    final startFlexCtrl = TextEditingController(text: _settings.startFlex.toString());
+    final startKCtrl = TextEditingController(text: _settings.startK.toString());
+    final startDstCtrl = TextEditingController(text: _settings.startDst.toString());
+
+    final minQbCtrl = TextEditingController(text: _settings.minQb.toString());
+    final minRbCtrl = TextEditingController(text: _settings.minRb.toString());
+    final minWrCtrl = TextEditingController(text: _settings.minWr.toString());
+    final minTeCtrl = TextEditingController(text: _settings.minTe.toString());
+    final minKCtrl = TextEditingController(text: _settings.minK.toString());
+    final minDstCtrl = TextEditingController(text: _settings.minDst.toString());
 
     // Passing Controllers
     final passTdCtrl = TextEditingController(text: _settings.passTdPoints.toString());
@@ -529,23 +1066,24 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
       builder: (ctx) => StatefulBuilder(
         builder: (context, setDialogState) {
           return DefaultTabController(
-            length: 3,
+            length: 4,
             child: AlertDialog(
               backgroundColor: const Color(0xFF1E1716),
               title: const TabBar(
+                isScrollable: true,
                 indicatorColor: Color(0xFF6750A4),
                 tabs: [
-                  Tab(icon: Icon(Icons.tune), text: 'General & Teams'),
+                  Tab(icon: Icon(Icons.tune), text: 'League & Order'),
+                  Tab(icon: Icon(Icons.people_outline), text: 'Roster Requirements'),
                   Tab(icon: Icon(Icons.sports_football), text: 'Offense & Kicking'),
                   Tab(icon: Icon(Icons.shield), text: 'Defense / Special Teams'),
                 ],
               ),
               content: SizedBox(
-                width: 620,
+                width: 650,
                 height: 520,
                 child: TabBarView(
                   children: [
-                    // Tab 1: General & Teams
                     SingleChildScrollView(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
@@ -573,6 +1111,7 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                                       setDialogState(() {
                                         tempTeams = v;
                                         if (tempMyTeamIndex >= v) tempMyTeamIndex = 0;
+                                        tempDraftOrder = List.generate(v, (i) => i);
                                       });
                                     }
                                   },
@@ -582,7 +1121,7 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                               Expanded(
                                 child: DropdownButtonFormField<int>(
                                   initialValue: tempRounds,
-                                  decoration: const InputDecoration(labelText: 'Draft Rounds'),
+                                  decoration: const InputDecoration(labelText: 'Draft Rounds (Total Roster Slots)'),
                                   dropdownColor: const Color(0xFF2C2220),
                                   items: [12, 14, 15, 16, 17, 18, 20]
                                       .map((r) => DropdownMenuItem(value: r, child: Text('$r Rounds')))
@@ -594,9 +1133,45 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                               ),
                             ],
                           ),
+                          const SizedBox(height: 12),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: DropdownButtonFormField<DraftType>(
+                                  initialValue: tempDraftType,
+                                  decoration: const InputDecoration(labelText: 'Draft Format'),
+                                  dropdownColor: const Color(0xFF2C2220),
+                                  items: const [
+                                    DropdownMenuItem(value: DraftType.snake, child: Text('Snake Draft (Alternating)')),
+                                    DropdownMenuItem(value: DraftType.linear, child: Text('Linear Draft (Fixed 1-N)')),
+                                  ],
+                                  onChanged: (v) {
+                                    if (v != null) setDialogState(() => tempDraftType = v);
+                                  },
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              OutlinedButton.icon(
+                                style: OutlinedButton.styleFrom(
+                                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 16),
+                                  foregroundColor: Colors.amberAccent,
+                                  side: const BorderSide(color: Colors.amberAccent),
+                                ),
+                                icon: const Icon(Icons.shuffle, size: 18),
+                                label: const Text('Randomize Draft Order'),
+                                onPressed: () {
+                                  setDialogState(() {
+                                    final list = List<int>.generate(tempTeams, (i) => i);
+                                    list.shuffle(Random());
+                                    tempDraftOrder = list;
+                                  });
+                                },
+                              ),
+                            ],
+                          ),
                           const SizedBox(height: 16),
                           const Text(
-                            'Customize Team Names (Click Radio to Set "My Team"):',
+                            'Team Names & Round 1 Draft Slot (Click Radio to Set "My Team"):',
                             style: TextStyle(fontWeight: FontWeight.bold),
                           ),
                           const SizedBox(height: 8),
@@ -604,29 +1179,67 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                             shrinkWrap: true,
                             physics: const NeverScrollableScrollPhysics(),
                             itemCount: tempTeams,
-                            itemBuilder: (context, i) {
-                              final isMySquad = i == tempMyTeamIndex;
+                            itemBuilder: (context, slotIdx) {
+                              final teamIdx = tempDraftOrder[slotIdx];
+                              final isMySquad = teamIdx == tempMyTeamIndex;
+
                               return Padding(
-                                padding: const EdgeInsets.symmetric(vertical: 4.0),
+                                padding: const EdgeInsets.symmetric(vertical: 3.0),
                                 child: Row(
                                   children: [
+                                    Container(
+                                      width: 58,
+                                      alignment: Alignment.center,
+                                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                                      decoration: BoxDecoration(
+                                        color: const Color(0xFF2C2220),
+                                        borderRadius: BorderRadius.circular(4),
+                                        border: Border.all(color: Colors.white24),
+                                      ),
+                                      child: Text('Slot ${slotIdx + 1}', style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                                    ),
                                     IconButton(
                                       icon: Icon(
                                         isMySquad ? Icons.radio_button_checked : Icons.radio_button_unchecked,
                                         color: isMySquad ? Colors.amberAccent : Colors.white60,
                                       ),
                                       onPressed: () {
-                                        setDialogState(() => tempMyTeamIndex = i);
+                                        setDialogState(() => tempMyTeamIndex = teamIdx);
                                       },
                                     ),
                                     Expanded(
                                       child: TextField(
-                                        controller: teamControllers[i],
+                                        controller: teamControllers[teamIdx],
                                         decoration: InputDecoration(
-                                          labelText: isMySquad ? 'Team ${i + 1} (My Team)' : 'Team ${i + 1}',
+                                          labelText: isMySquad ? 'Team ${teamIdx + 1} (My Team)' : 'Team ${teamIdx + 1}',
                                           isDense: true,
                                         ),
                                       ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    IconButton(
+                                      icon: const Icon(Icons.arrow_upward, size: 16),
+                                      onPressed: slotIdx > 0
+                                          ? () {
+                                              setDialogState(() {
+                                                final temp = tempDraftOrder[slotIdx];
+                                                tempDraftOrder[slotIdx] = tempDraftOrder[slotIdx - 1];
+                                                tempDraftOrder[slotIdx - 1] = temp;
+                                              });
+                                            }
+                                          : null,
+                                    ),
+                                    IconButton(
+                                      icon: const Icon(Icons.arrow_downward, size: 16),
+                                      onPressed: slotIdx < tempTeams - 1
+                                          ? () {
+                                              setDialogState(() {
+                                                final temp = tempDraftOrder[slotIdx];
+                                                tempDraftOrder[slotIdx] = tempDraftOrder[slotIdx + 1];
+                                                tempDraftOrder[slotIdx + 1] = temp;
+                                              });
+                                            }
+                                          : null,
                                     ),
                                   ],
                                 ),
@@ -636,8 +1249,45 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                         ],
                       ),
                     ),
-
-                    // Tab 2: Offense & Kicking (Manual Numeric Entry)
+                    SingleChildScrollView(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'Active Starting Lineup Configuration:',
+                            style: TextStyle(fontWeight: FontWeight.bold, color: Colors.amberAccent),
+                          ),
+                          const Text(
+                            'Higher starter counts directly inflate baseline VORP requirements for that position.',
+                            style: TextStyle(fontSize: 12, color: Colors.white60),
+                          ),
+                          const SizedBox(height: 8),
+                          _buildNumField('Starting Quarterbacks (QB)', startQbCtrl),
+                          _buildNumField('Starting Running Backs (RB)', startRbCtrl),
+                          _buildNumField('Starting Wide Receivers (WR)', startWrCtrl),
+                          _buildNumField('Starting Tight Ends (TE)', startTeCtrl),
+                          _buildNumField('Starting FLEX (RB/WR/TE)', startFlexCtrl),
+                          _buildNumField('Starting Kickers (K)', startKCtrl),
+                          _buildNumField('Starting Defenses (D/ST)', startDstCtrl),
+                          const Divider(color: Colors.white24, height: 24),
+                          const Text(
+                            'Mandatory Positional Draft Quotas:',
+                            style: TextStyle(fontWeight: FontWeight.bold, color: Colors.cyanAccent),
+                          ),
+                          const Text(
+                            'If your league requires drafting minimum position counts, the algorithm increases urgency to secure positions before late rounds.',
+                            style: TextStyle(fontSize: 12, color: Colors.white60),
+                          ),
+                          const SizedBox(height: 8),
+                          _buildNumField('Must Draft QBs (e.g., 2)', minQbCtrl),
+                          _buildNumField('Must Draft RBs (e.g., 4)', minRbCtrl),
+                          _buildNumField('Must Draft WRs (e.g., 4)', minWrCtrl),
+                          _buildNumField('Must Draft TEs (e.g., 2)', minTeCtrl),
+                          _buildNumField('Must Draft Kickers (e.g., 1)', minKCtrl),
+                          _buildNumField('Must Draft Defenses (e.g., 1)', minDstCtrl),
+                        ],
+                      ),
+                    ),
                     SingleChildScrollView(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
@@ -650,7 +1300,6 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                           _buildNumField('250+ PaYd Game Bonus', pass250Ctrl),
                           _buildNumField('450+ PaYd Game Bonus', pass450Ctrl),
                           _buildNumField('Interception Thrown (PaINT)', passIntCtrl),
-
                           const Divider(color: Colors.white24),
                           const Text('Rushing Tiers & Bonuses', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blueAccent)),
                           _buildNumField('Rushing TD Value (RuTD)', rushTdCtrl),
@@ -660,7 +1309,6 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                           _buildNumField('100+ RuYd Game Bonus', rush100Ctrl),
                           _buildNumField('200+ RuYd Game Bonus', rush200Ctrl),
                           _buildNumField('300+ RuYd Game Bonus', rush300Ctrl),
-
                           const Divider(color: Colors.white24),
                           const Text('Receiving Tiers & Bonuses', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.greenAccent)),
                           _buildNumField('Receiving TD Value (ReTD)', recTdCtrl),
@@ -671,7 +1319,6 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                           _buildNumField('200+ ReYd Game Bonus', rec200Ctrl),
                           _buildNumField('300+ ReYd Game Bonus', rec300Ctrl),
                           _buildNumField('Reception (PPR Value)', pprCtrl),
-
                           const Divider(color: Colors.white24),
                           const Text('Kicking Distance Brackets', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.cyanAccent)),
                           _buildNumField('Base Field Goal (FG)', fgBaseCtrl),
@@ -682,8 +1329,6 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                         ],
                       ),
                     ),
-
-                    // Tab 3: Defense / Special Teams (Manual Numeric Entry)
                     SingleChildScrollView(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
@@ -695,7 +1340,6 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                           _buildNumField('Safety (STY)', safetyCtrl),
                           _buildNumField('Blocked Kick/Punt/XP (BFB/BP/BXP)', blockedKickCtrl),
                           _buildNumField('D/ST Touchdown (DTD)', defTdCtrl),
-
                           const Divider(color: Colors.white24),
                           const Text('Points Against (PA) Brackets', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.orangeAccent)),
                           _buildNumField('0 PA (Shutout)', pa0Ctrl),
@@ -725,13 +1369,29 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                       _settings.numTeams = tempTeams;
                       _settings.numRounds = tempRounds;
                       _settings.myTeamIndex = tempMyTeamIndex;
+                      _settings.draftType = tempDraftType;
+                      _settings.draftOrder = tempDraftOrder;
                       for (int i = 0; i < 16; i++) {
                         _settings.teamNames[i] = teamControllers[i].text.trim().isEmpty
                             ? 'Team ${i + 1}'
                             : teamControllers[i].text.trim();
                       }
 
-                      // Parse Passing
+                      _settings.startQb = int.tryParse(startQbCtrl.text) ?? _settings.startQb;
+                      _settings.startRb = int.tryParse(startRbCtrl.text) ?? _settings.startRb;
+                      _settings.startWr = int.tryParse(startWrCtrl.text) ?? _settings.startWr;
+                      _settings.startTe = int.tryParse(startTeCtrl.text) ?? _settings.startTe;
+                      _settings.startFlex = int.tryParse(startFlexCtrl.text) ?? _settings.startFlex;
+                      _settings.startK = int.tryParse(startKCtrl.text) ?? _settings.startK;
+                      _settings.startDst = int.tryParse(startDstCtrl.text) ?? _settings.startDst;
+
+                      _settings.minQb = int.tryParse(minQbCtrl.text) ?? _settings.minQb;
+                      _settings.minRb = int.tryParse(minRbCtrl.text) ?? _settings.minRb;
+                      _settings.minWr = int.tryParse(minWrCtrl.text) ?? _settings.minWr;
+                      _settings.minTe = int.tryParse(minTeCtrl.text) ?? _settings.minTe;
+                      _settings.minK = int.tryParse(minKCtrl.text) ?? _settings.minK;
+                      _settings.minDst = int.tryParse(minDstCtrl.text) ?? _settings.minDst;
+
                       _settings.passTdPoints = double.tryParse(passTdCtrl.text) ?? _settings.passTdPoints;
                       _settings.passTd50PlusBonus = double.tryParse(passTd50Ctrl.text) ?? _settings.passTd50PlusBonus;
                       _settings.passTd75PlusBonus = double.tryParse(passTd75Ctrl.text) ?? _settings.passTd75PlusBonus;
@@ -740,7 +1400,6 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                       _settings.pass450Bonus = double.tryParse(pass450Ctrl.text) ?? _settings.pass450Bonus;
                       _settings.passIntPoints = double.tryParse(passIntCtrl.text) ?? _settings.passIntPoints;
 
-                      // Parse Rushing
                       _settings.rushTdPoints = double.tryParse(rushTdCtrl.text) ?? _settings.rushTdPoints;
                       _settings.rushTd50PlusBonus = double.tryParse(rushTd50Ctrl.text) ?? _settings.rushTd50PlusBonus;
                       _settings.rushTd75PlusBonus = double.tryParse(rushTd75Ctrl.text) ?? _settings.rushTd75PlusBonus;
@@ -749,7 +1408,6 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                       _settings.rush200Bonus = double.tryParse(rush200Ctrl.text) ?? _settings.rush200Bonus;
                       _settings.rush300Bonus = double.tryParse(rush300Ctrl.text) ?? _settings.rush300Bonus;
 
-                      // Parse Receiving
                       _settings.recTdPoints = double.tryParse(recTdCtrl.text) ?? _settings.recTdPoints;
                       _settings.recTd50PlusBonus = double.tryParse(recTd50Ctrl.text) ?? _settings.recTd50PlusBonus;
                       _settings.recTd75PlusBonus = double.tryParse(recTd75Ctrl.text) ?? _settings.recTd75PlusBonus;
@@ -759,14 +1417,12 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                       _settings.rec300Bonus = double.tryParse(rec300Ctrl.text) ?? _settings.rec300Bonus;
                       _settings.ppr = double.tryParse(pprCtrl.text) ?? _settings.ppr;
 
-                      // Parse Kicking
                       _settings.fgBasePoints = double.tryParse(fgBaseCtrl.text) ?? _settings.fgBasePoints;
                       _settings.fg40Bonus = double.tryParse(fg40Ctrl.text) ?? _settings.fg40Bonus;
                       _settings.fg50Bonus = double.tryParse(fg50Ctrl.text) ?? _settings.fg50Bonus;
                       _settings.fg60Bonus = double.tryParse(fg60Ctrl.text) ?? _settings.fg60Bonus;
                       _settings.xpPoints = double.tryParse(xpCtrl.text) ?? _settings.xpPoints;
 
-                      // Parse Defense
                       _settings.sackPoints = double.tryParse(sackCtrl.text) ?? _settings.sackPoints;
                       _settings.intPoints = double.tryParse(intCtrl.text) ?? _settings.intPoints;
                       _settings.fumbleRecPoints = double.tryParse(fumbleRecCtrl.text) ?? _settings.fumbleRecPoints;
@@ -852,12 +1508,12 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
               child: ListView(
                 padding: const EdgeInsets.all(12.0),
                 children: [
-                  _buildSlotCategory('Quarterbacks (QB)', myQBs, 'QB'),
-                  _buildSlotCategory('Running Backs (RB)', myRBs, 'RB'),
-                  _buildSlotCategory('Wide Receivers (WR)', myWRs, 'WR'),
-                  _buildSlotCategory('Tight Ends (TE)', myTEs, 'TE'),
-                  _buildSlotCategory('Kickers (K)', myKs, 'K'),
-                  _buildSlotCategory('Defense / Special Teams (D/ST)', myDSTs, 'DST'),
+                  _buildSlotCategory('Quarterbacks (QB)', myQBs, 'QB', minQuota: _settings.minQb),
+                  _buildSlotCategory('Running Backs (RB)', myRBs, 'RB', minQuota: _settings.minRb),
+                  _buildSlotCategory('Wide Receivers (WR)', myWRs, 'WR', minQuota: _settings.minWr),
+                  _buildSlotCategory('Tight Ends (TE)', myTEs, 'TE', minQuota: _settings.minTe),
+                  _buildSlotCategory('Kickers (K)', myKs, 'K', minQuota: _settings.minK),
+                  _buildSlotCategory('Defense / Special Teams (D/ST)', myDSTs, 'DST', minQuota: _settings.minDst),
                 ],
               ),
             ),
@@ -867,7 +1523,9 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
     );
   }
 
-  Widget _buildSlotCategory(String title, List<Player> players, String pos) {
+  Widget _buildSlotCategory(String title, List<Player> players, String pos, {int minQuota = 0}) {
+    final bool quotaMet = players.length >= minQuota;
+
     return Card(
       color: const Color(0xFF140D0C),
       margin: const EdgeInsets.symmetric(vertical: 4.0),
@@ -880,7 +1538,14 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 Text(title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('${players.length}', style: const TextStyle(color: Colors.white60, fontSize: 12)),
+                Text(
+                  '${players.length}${minQuota > 0 ? " / min $minQuota" : ""}',
+                  style: TextStyle(
+                    color: quotaMet ? Colors.greenAccent : Colors.orangeAccent,
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
               ],
             ),
             const SizedBox(height: 4),
@@ -909,6 +1574,126 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
     );
   }
 
+  Widget _buildRecentPickTicker() {
+    if (_draftHistory.isEmpty) return const SizedBox.shrink();
+    final recentPicks = _draftHistory.reversed.take(6).toList();
+
+    return Container(
+      height: 38,
+      color: const Color(0xFF1A1211),
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      child: Row(
+        children: [
+          const Icon(Icons.flash_on, color: Colors.amberAccent, size: 16),
+          const SizedBox(width: 6),
+          const Text('RECENT:', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: Colors.white70)),
+          const SizedBox(width: 8),
+          Expanded(
+            child: ListView.separated(
+              scrollDirection: Axis.horizontal,
+              itemCount: recentPicks.length,
+              separatorBuilder: (_, __) => const VerticalDivider(color: Colors.white12, width: 16),
+              itemBuilder: (context, idx) {
+                final pick = recentPicks[idx];
+                return Center(
+                  child: RichText(
+                    text: TextSpan(
+                      children: [
+                        TextSpan(
+                          text: '#${pick.pickNumber} ',
+                          style: const TextStyle(color: Colors.amberAccent, fontWeight: FontWeight.bold, fontSize: 11),
+                        ),
+                        TextSpan(
+                          text: '${pick.player.name} (${pick.player.position}) ',
+                          style: const TextStyle(color: Colors.white, fontSize: 11),
+                        ),
+                        TextSpan(
+                          text: '→ ${pick.draftedByTeam}',
+                          style: TextStyle(color: pick.isMyTeam ? Colors.greenAccent : Colors.white60, fontSize: 11),
+                        ),
+                        if (pick.isKeeper)
+                          const TextSpan(
+                            text: ' [K]',
+                            style: TextStyle(color: Colors.orangeAccent, fontSize: 10, fontWeight: FontWeight.bold),
+                          ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildOnTheClockHeader() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 10.0),
+      decoration: BoxDecoration(
+        color: _isMyTurn
+            ? const Color(0xFF2E7D32).withValues(alpha: 0.3)
+            : const Color(0xFF2C2220),
+        border: Border(
+          bottom: BorderSide(
+            color: _isMyTurn ? Colors.greenAccent : Colors.white12,
+            width: _isMyTurn ? 2 : 1,
+          ),
+        ),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Row(
+            children: [
+              Icon(
+                _isDraftComplete ? Icons.flag : (_isMyTurn ? Icons.stars : Icons.timer_outlined),
+                color: _isDraftComplete
+                    ? Colors.amberAccent
+                    : (_isMyTurn ? Colors.greenAccent : Colors.purpleAccent),
+                size: 22,
+              ),
+              const SizedBox(width: 10),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    _isDraftComplete ? 'DRAFT COMPLETE' : 'ON THE CLOCK: $_onTheClockTeamName',
+                    style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.bold,
+                      color: _isMyTurn ? Colors.greenAccent : Colors.white,
+                    ),
+                  ),
+                  Text(
+                    _isDraftComplete
+                        ? '${_draftHistory.length} total picks recorded'
+                        : 'Round $_currentRound, Pick $_currentRoundPick (Overall #$_currentPickNumber) • ${_settings.draftType == DraftType.snake ? "Snake" : "Linear"} Format',
+                    style: const TextStyle(fontSize: 11, color: Colors.white70),
+                  ),
+                ],
+              ),
+            ],
+          ),
+          if (_isMyTurn)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color: Colors.greenAccent,
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: const Text(
+                'YOUR PICK',
+                style: TextStyle(color: Colors.black, fontSize: 11, fontWeight: FontWeight.bold),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -927,6 +1712,25 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
         backgroundColor: Colors.transparent,
         elevation: 0,
         actions: [
+          StreamBuilder<List<Player>>(
+            stream: widget.db.select(widget.db.players).watch(),
+            builder: (context, snapshot) {
+              return IconButton(
+                icon: const Icon(Icons.bookmark_added_outlined),
+                tooltip: 'Pre-Draft Keepers',
+                onPressed: () {
+                  if (snapshot.hasData) {
+                    _showKeepersDialog(snapshot.data!);
+                  }
+                },
+              );
+            },
+          ),
+          IconButton(
+            icon: const Icon(Icons.groups_outlined),
+            tooltip: 'View All Teams Rosters',
+            onPressed: _showAllTeamsRostersDialog,
+          ),
           Builder(
             builder: (ctx) => IconButton(
               icon: const Icon(Icons.shield_outlined),
@@ -985,13 +1789,14 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                   posGroups[key]!.sort((a, b) => b.value.compareTo(a.value));
                 }
 
+                final flexPerPos = (_settings.startFlex * _settings.numTeams) / 2.0;
                 final Map<String, int> vorpBaselines = {
-                  'QB': _settings.numTeams,
-                  'RB': _settings.numTeams * 2,
-                  'WR': (_settings.numTeams * 2.5).toInt(),
-                  'TE': _settings.numTeams,
-                  'K': _settings.numTeams,
-                  'DST': _settings.numTeams,
+                  'QB': max(1, _settings.startQb * _settings.numTeams),
+                  'RB': max(1, (_settings.startRb * _settings.numTeams) + flexPerPos.toInt()),
+                  'WR': max(1, (_settings.startWr * _settings.numTeams) + flexPerPos.toInt()),
+                  'TE': max(1, _settings.startTe * _settings.numTeams),
+                  'K': max(1, _settings.startK * _settings.numTeams),
+                  'DST': max(1, _settings.startDst * _settings.numTeams),
                 };
 
                 final Map<String, double> replacementPoints = {};
@@ -1011,13 +1816,16 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                   final pos = entry.key;
                   final list = entry.value;
                   final repPts = replacementPoints[pos] ?? 0.0;
+                  final scarcityMult = _getQuotaScarcityMultiplier(pos);
 
                   for (int i = 0; i < list.length; i++) {
                     final p = list[i].key;
                     final pts = list[i].value;
-                    final vorp = (pts - repPts).clamp(0.0, 999.0);
+                    final rawVorp = (pts - repPts).clamp(0.0, 999.0);
+                    final vorp = rawVorp * scarcityMult;
+
                     final nextPts = (i + 1 < list.length) ? list[i + 1].value : repPts;
-                    final vona = (pts - nextPts).clamp(0.0, 999.0);
+                    final vona = (pts - nextPts).clamp(0.0, 999.0) * scarcityMult;
 
                     ranked.add(RankedPlayer(
                       player: p,
@@ -1028,41 +1836,117 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                   }
                 }
 
-                ranked.sort((a, b) => b.vorp.compareTo(a.vorp));
+                switch (_selectedSort) {
+                  case SortMetric.vorp:
+                    ranked.sort((a, b) => b.vorp.compareTo(a.vorp));
+                    break;
+                  case SortMetric.vona:
+                    ranked.sort((a, b) => b.vona.compareTo(a.vona));
+                    break;
+                  case SortMetric.projPoints:
+                    ranked.sort((a, b) => b.projPoints.compareTo(a.projPoints));
+                    break;
+                  case SortMetric.priorYear:
+                    ranked.sort((a, b) => b.player.priorYearPts.compareTo(a.player.priorYearPts));
+                    break;
+                }
 
-                final filtered = _selectedPosition == 'ALL'
-                    ? ranked
-                    : ranked.where((r) => r.player.position == _selectedPosition).toList();
+                final filtered = ranked.where((r) {
+                  final p = r.player;
+                  if (_selectedPosition != 'ALL' && p.position != _selectedPosition) {
+                    return false;
+                  }
+                  if (_filterTargetsOnly && !_targetPlayerIds.contains(p.id)) {
+                    return false;
+                  }
+                  if (_hideFadedPlayers && _fadePlayerIds.contains(p.id)) {
+                    return false;
+                  }
+                  return true;
+                }).toList();
 
                 return Column(
                   children: [
+                    _buildOnTheClockHeader(),
+                    _buildRecentPickTicker(),
                     Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
-                      alignment: Alignment.centerLeft,
-                      child: SingleChildScrollView(
-                        scrollDirection: Axis.horizontal,
-                        child: Row(
-                          children: ['ALL', 'QB', 'RB', 'WR', 'TE', 'K', 'DST'].map((pos) {
-                            final isSelected = _selectedPosition == pos;
-                            return Padding(
-                              padding: const EdgeInsets.only(right: 8.0),
-                              child: ChoiceChip(
-                                label: Text(pos),
-                                selected: isSelected,
-                                selectedColor: const Color(0xFF6750A4),
-                                labelStyle: TextStyle(
-                                  color: isSelected ? Colors.white : Colors.white70,
-                                  fontWeight: FontWeight.bold,
-                                ),
-                                onSelected: (_) {
-                                  setState(() {
-                                    _selectedPosition = pos;
-                                  });
-                                },
+                      padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 6.0),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: SingleChildScrollView(
+                              scrollDirection: Axis.horizontal,
+                              child: Row(
+                                children: [
+                                  ...['ALL', 'QB', 'RB', 'WR', 'TE', 'K', 'DST'].map((pos) {
+                                    final isSelected = _selectedPosition == pos;
+                                    return Padding(
+                                      padding: const EdgeInsets.only(right: 6.0),
+                                      child: ChoiceChip(
+                                        label: Text(pos),
+                                        selected: isSelected,
+                                        selectedColor: const Color(0xFF6750A4),
+                                        labelStyle: TextStyle(
+                                          color: isSelected ? Colors.white : Colors.white70,
+                                          fontWeight: FontWeight.bold,
+                                          fontSize: 12,
+                                        ),
+                                        onSelected: (_) {
+                                          setState(() {
+                                            _selectedPosition = pos;
+                                          });
+                                        },
+                                      ),
+                                    );
+                                  }),
+                                  const SizedBox(width: 8),
+                                  FilterChip(
+                                    label: Text('🎯 Targets (${_targetPlayerIds.length})'),
+                                    selected: _filterTargetsOnly,
+                                    selectedColor: Colors.amber.withValues(alpha: 0.3),
+                                    checkmarkColor: Colors.amberAccent,
+                                    labelStyle: TextStyle(
+                                      color: _filterTargetsOnly ? Colors.amberAccent : Colors.white70,
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                    onSelected: (val) {
+                                      setState(() => _filterTargetsOnly = val);
+                                    },
+                                  ),
+                                  const SizedBox(width: 6),
+                                  FilterChip(
+                                    label: Text(_hideFadedPlayers ? '🚫 Faded Hidden' : '🚫 Faded Shown'),
+                                    selected: _hideFadedPlayers,
+                                    selectedColor: Colors.redAccent.withValues(alpha: 0.3),
+                                    checkmarkColor: Colors.redAccent,
+                                    labelStyle: TextStyle(
+                                      color: _hideFadedPlayers ? Colors.redAccent : Colors.white70,
+                                      fontSize: 12,
+                                    ),
+                                    onSelected: (val) {
+                                      setState(() => _hideFadedPlayers = val);
+                                    },
+                                  ),
+                                ],
                               ),
-                            );
-                          }).toList(),
-                        ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          DropdownButton<SortMetric>(
+                            value: _selectedSort,
+                            dropdownColor: const Color(0xFF2C2220),
+                            items: const [
+                              DropdownMenuItem(value: SortMetric.vorp, child: Text('Sort: VORP', style: TextStyle(fontSize: 12))),
+                              DropdownMenuItem(value: SortMetric.vona, child: Text('Sort: VONA', style: TextStyle(fontSize: 12))),
+                              DropdownMenuItem(value: SortMetric.projPoints, child: Text('Sort: Proj Pts', style: TextStyle(fontSize: 12))),
+                              DropdownMenuItem(value: SortMetric.priorYear, child: Text('Sort: Last Year', style: TextStyle(fontSize: 12))),
+                            ],
+                            onChanged: (v) {
+                              if (v != null) setState(() => _selectedSort = v);
+                            },
+                          ),
+                        ],
                       ),
                     ),
                     const Divider(height: 1, color: Colors.white12),
@@ -1076,70 +1960,176 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                           final p = item.player;
                           final cliffColor = _getTierCliffColor(item.vona);
 
+                          final isTarget = _targetPlayerIds.contains(p.id);
+                          final isFaded = _fadePlayerIds.contains(p.id);
+
                           return ListTile(
+                            tileColor: isTarget
+                                ? Colors.amber.withValues(alpha: 0.08)
+                                : isFaded
+                                    ? Colors.black26
+                                    : null,
                             contentPadding: const EdgeInsets.symmetric(
                               horizontal: 16.0,
                               vertical: 4.0,
                             ),
-                            leading: CircleAvatar(
-                              backgroundColor: _getPositionBadgeColor(p.position),
-                              child: Text(
-                                p.position,
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontWeight: FontWeight.bold,
-                                  fontSize: 12,
-                                ),
-                              ),
-                            ),
-                            title: Text(
-                              '${p.name} (${p.nflTeam})',
-                              style: const TextStyle(
-                                fontWeight: FontWeight.bold,
-                                fontSize: 16,
-                              ),
-                            ),
-                            subtitle: Row(
+                            leading: Stack(
                               children: [
-                                Text(
-                                  'VORP: +${item.vorp.toStringAsFixed(1)} | ',
-                                  style: const TextStyle(color: Colors.white70),
-                                ),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 6.0,
-                                    vertical: 2.0,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: cliffColor.withValues(alpha: 0.18),
-                                    borderRadius: BorderRadius.circular(4.0),
-                                    border: Border.all(
-                                      color: cliffColor.withValues(alpha: 0.6),
-                                      width: 1,
-                                    ),
-                                  ),
+                                CircleAvatar(
+                                  backgroundColor: isFaded
+                                      ? Colors.grey.shade800
+                                      : _getPositionBadgeColor(p.position),
                                   child: Text(
-                                    'VONA: +${item.vona.toStringAsFixed(1)}',
+                                    p.position,
                                     style: TextStyle(
-                                      color: cliffColor,
+                                      color: isFaded ? Colors.white38 : Colors.white,
                                       fontWeight: FontWeight.bold,
                                       fontSize: 12,
                                     ),
                                   ),
                                 ),
+                                if (isTarget)
+                                  const Positioned(
+                                    right: 0,
+                                    bottom: 0,
+                                    child: Icon(Icons.star, color: Colors.amberAccent, size: 14),
+                                  ),
+                                if (isFaded)
+                                  const Positioned(
+                                    right: 0,
+                                    bottom: 0,
+                                    child: Icon(Icons.block, color: Colors.redAccent, size: 14),
+                                  ),
+                              ],
+                            ),
+                            title: Row(
+                              children: [
                                 Text(
-                                  ' | Proj: ${item.projPoints.toStringAsFixed(1)} pts | Age: ${p.age}',
-                                  style: const TextStyle(color: Colors.white70),
+                                  '${p.name} (${p.nflTeam})',
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 15,
+                                    color: isFaded ? Colors.white38 : (isTarget ? Colors.amberAccent : Colors.white),
+                                    decoration: isFaded ? TextDecoration.lineThrough : null,
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                Text(
+                                  'Age: ${p.age}',
+                                  style: TextStyle(fontSize: 12, color: isFaded ? Colors.white24 : Colors.white54),
                                 ),
                               ],
                             ),
-                            trailing: ElevatedButton(
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: const Color(0xFF2C2220),
-                                foregroundColor: Colors.white70,
-                              ),
-                              onPressed: () => _showDraftSelectionDialog(p),
-                              child: const Text('Draft'),
+                            subtitle: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const SizedBox(height: 2),
+                                Row(
+                                  children: [
+                                    Text(
+                                      'VORP: +${item.vorp.toStringAsFixed(1)} | ',
+                                      style: TextStyle(
+                                        color: isFaded
+                                            ? Colors.white24
+                                            : (_selectedSort == SortMetric.vorp ? Colors.greenAccent : Colors.white70),
+                                        fontWeight: _selectedSort == SortMetric.vorp ? FontWeight.bold : FontWeight.normal,
+                                      ),
+                                    ),
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 6.0,
+                                        vertical: 2.0,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: cliffColor.withValues(alpha: isFaded ? 0.05 : 0.18),
+                                        borderRadius: BorderRadius.circular(4.0),
+                                        border: Border.all(
+                                          color: cliffColor.withValues(alpha: isFaded ? 0.2 : 0.6),
+                                          width: 1,
+                                        ),
+                                      ),
+                                      child: Text(
+                                        'VONA: +${item.vona.toStringAsFixed(1)}',
+                                        style: TextStyle(
+                                          color: isFaded ? cliffColor.withValues(alpha: 0.4) : cliffColor,
+                                          fontWeight: FontWeight.bold,
+                                          fontSize: 12,
+                                        ),
+                                      ),
+                                    ),
+                                    Text(
+                                      ' | Proj: ${item.projPoints.toStringAsFixed(1)} pts',
+                                      style: TextStyle(
+                                        color: isFaded
+                                            ? Colors.white24
+                                            : (_selectedSort == SortMetric.projPoints ? Colors.amberAccent : Colors.white70),
+                                        fontWeight: _selectedSort == SortMetric.projPoints ? FontWeight.bold : FontWeight.normal,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  'Last Year: ${p.priorYearPts > 0 ? "${p.priorYearPts.toStringAsFixed(1)} pts (${p.priorYearSummary})" : "Rookie / No prior data"}',
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    color: isFaded
+                                        ? Colors.white12
+                                        : (_selectedSort == SortMetric.priorYear ? Colors.cyanAccent : Colors.white38),
+                                    fontWeight: _selectedSort == SortMetric.priorYear ? FontWeight.bold : FontWeight.normal,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            trailing: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                IconButton(
+                                  icon: Icon(
+                                    isTarget ? Icons.star : Icons.star_border,
+                                    color: isTarget ? Colors.amberAccent : Colors.white38,
+                                    size: 20,
+                                  ),
+                                  tooltip: isTarget ? 'Untarget Player' : 'Target Player',
+                                  onPressed: () {
+                                    setState(() {
+                                      if (isTarget) {
+                                        _targetPlayerIds.remove(p.id);
+                                      } else {
+                                        _targetPlayerIds.add(p.id);
+                                        _fadePlayerIds.remove(p.id);
+                                      }
+                                    });
+                                  },
+                                ),
+                                IconButton(
+                                  icon: Icon(
+                                    isFaded ? Icons.block : Icons.block_outlined,
+                                    color: isFaded ? Colors.redAccent : Colors.white38,
+                                    size: 19,
+                                  ),
+                                  tooltip: isFaded ? 'Remove Do Not Draft Flag' : 'Flag as Do Not Draft',
+                                  onPressed: () {
+                                    setState(() {
+                                      if (isFaded) {
+                                        _fadePlayerIds.remove(p.id);
+                                      } else {
+                                        _fadePlayerIds.add(p.id);
+                                        _targetPlayerIds.remove(p.id);
+                                      }
+                                    });
+                                  },
+                                ),
+                                const SizedBox(width: 4),
+                                ElevatedButton(
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: const Color(0xFF2C2220),
+                                    foregroundColor: Colors.white70,
+                                  ),
+                                  onPressed: () => _showDraftSelectionDialog(p),
+                                  child: const Text('Draft'),
+                                ),
+                              ],
                             ),
                           );
                         },
