@@ -42,11 +42,33 @@ class OnTheClockApp extends StatelessWidget {
 }
 
 enum DraftType { snake, linear }
-enum SortMetric { vorp, vona, projPoints, priorYear, adp }
+
+enum SortMetric {
+  recommended,
+  customProj,
+  standardProj,
+  threeYearAvg,
+  adp,
+  vorp,
+  vona,
+  priorYear,
+}
 
 enum ScarcityRisk { secure, runDetected, cliffDanger }
-
 enum ValueAlertLevel { normal, valueDrop, grabNow, reachWarning }
+
+enum DrafterArchetype {
+  balanced('Balanced', Color(0xFF9E9E9E)),
+  zeroRb('Zero-RB Hunter', Color(0xFFFF4081)),
+  heroRb('Hero-RB Build', Color(0xFF00E5FF)),
+  bullyRb('Bully RB Heavy', Color(0xFF76FF03)),
+  earlyQb('Early QB Reacher', Color(0xFFFFD700)),
+  eliteTeAnchor('Elite TE Anchor', Color(0xFFFF6D00));
+
+  final String label;
+  final Color color;
+  const DrafterArchetype(this.label, this.color);
+}
 
 class ValueAlert {
   final ValueAlertLevel level;
@@ -94,10 +116,8 @@ class KeeperSelection {
   });
 
   String getTeamName(LeagueSettings settings) => settings.teamNames[teamIndex];
-
   int getRoundPick(LeagueSettings settings) =>
       settings.getRoundPickForTeam(teamIndex, forfeitRound);
-
   int getOverallPick(LeagueSettings settings) =>
       settings.calculateOverallPick(forfeitRound, getRoundPick(settings));
 }
@@ -233,16 +253,16 @@ class LeagueSettings {
     this.fg60Bonus = 4.0,
     this.xpPoints = 1.0,
     this.sackPoints = 2.0,
-    this.intPoints = 3.0,
-    this.fumbleRecPoints = 3.0,
-    this.safetyPoints = 8.0,
-    this.blockedKickPoints = 3.0,
+    this.intPoints = 2.0,
+    this.fumbleRecPoints = 2.0,
+    this.safetyPoints = 2.0,
+    this.blockedKickPoints = 2.0,
     this.defTdPoints = 6.0,
-    this.pa0Points = 12.0,
-    this.pa2to3Points = 8.0,
-    this.pa4to6Points = 6.0,
-    this.pa7to9Points = 4.0,
-    this.pa10to12Points = 2.0,
+    this.pa0Points = 5.0,
+    this.pa2to3Points = 4.0,
+    this.pa4to6Points = 3.0,
+    this.pa7to9Points = 1.0,
+    this.pa10to12Points = 0.0,
   })  : teamNames = teamNames ??
             List.generate(
               16,
@@ -300,14 +320,18 @@ class DraftPickRecord {
 
 class RankedPlayer {
   final Player player;
-  final double projPoints;
+  final double customProjPoints;
+  final double standardProjPoints;
+  final double recommendationScore;
   final double vorp;
   final double vona;
   final ValueAlert valueAlert;
 
   RankedPlayer({
     required this.player,
-    required this.projPoints,
+    required this.customProjPoints,
+    required this.standardProjPoints,
+    required this.recommendationScore,
     required this.vorp,
     required this.vona,
     required this.valueAlert,
@@ -324,6 +348,7 @@ class DraftBoardPage extends StatefulWidget {
 
 class _DraftBoardPageState extends State<DraftBoardPage> {
   late final CloudSyncService _syncService;
+  final TextEditingController _searchController = TextEditingController();
   final List<DraftPickRecord> _draftHistory = [];
   final List<KeeperSelection> _keepers = [];
   final Set<int> _targetPlayerIds = {};
@@ -331,7 +356,7 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
 
   final LeagueSettings _settings = LeagueSettings();
   String _selectedPosition = 'ALL';
-  SortMetric _selectedSort = SortMetric.vorp;
+  SortMetric _selectedSort = SortMetric.recommended;
   bool _filterTargetsOnly = false;
   bool _hideFadedPlayers = false;
   bool _isLoading = false;
@@ -341,6 +366,12 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
     super.initState();
     _syncService = CloudSyncService(widget.db);
     _initializeData();
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
   }
 
   Future<void> _initializeData() async {
@@ -353,7 +384,16 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
   Future<void> _sync() async {
     setState(() => _isLoading = true);
     try {
-      await _syncService.syncData();
+      final count = await _syncService.syncData();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Successfully synced $count players and NFL teams!'),
+            backgroundColor: const Color(0xFF6750A4),
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
     } finally {
       if (mounted) setState(() => _isLoading = false);
     }
@@ -403,6 +443,24 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
     return max(0, nextPick - _currentPickNumber);
   }
 
+  DrafterArchetype _detectOpponentArchetype(String teamName) {
+    final teamPicks = _draftHistory.where((p) => p.draftedByTeam == teamName).toList();
+    if (teamPicks.length < 3) return DrafterArchetype.balanced;
+
+    final firstFourPicks = teamPicks.take(4).toList();
+    final rbCount = firstFourPicks.where((p) => p.player.position == 'RB').length;
+    final qbEarly = firstFourPicks.any((p) => p.player.position == 'QB');
+    final teEarly = teamPicks.take(3).any((p) => p.player.position == 'TE');
+
+    if (rbCount == 0 && teamPicks.length >= 4) return DrafterArchetype.zeroRb;
+    if (rbCount >= 3) return DrafterArchetype.bullyRb;
+    if (teEarly) return DrafterArchetype.eliteTeAnchor;
+    if (qbEarly) return DrafterArchetype.earlyQb;
+    if (rbCount == 1 && teamPicks.length >= 4) return DrafterArchetype.heroRb;
+
+    return DrafterArchetype.balanced;
+  }
+
   ValueAlert _evaluateValueAlert(double adp) {
     if (adp >= 990.0) return ValueAlert.normal;
 
@@ -410,7 +468,6 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
     final nextMyPick = _calculateNextMyPickNumber().toDouble();
     final adpDiff = currentPick - adp;
 
-    // Major value drop: slipped 6+ picks past consensus ADP
     if (adpDiff >= 6.0) {
       return ValueAlert(
         level: ValueAlertLevel.valueDrop,
@@ -419,7 +476,6 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
       );
     }
 
-    // Must pick now: ADP indicates player won't survive until your next turn
     if (adp >= currentPick && adp < nextMyPick && _isMyTurn) {
       return const ValueAlert(
         level: ValueAlertLevel.grabNow,
@@ -428,7 +484,6 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
       );
     }
 
-    // Severe reach warning: reaching 12+ picks early when player projected to survive past next turn
     if ((adp - currentPick) >= 12.0 && adp > nextMyPick && _isMyTurn) {
       return const ValueAlert(
         level: ValueAlertLevel.reachWarning,
@@ -559,6 +614,31 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
     WidgetsBinding.instance.addPostFrameCallback((_) => _checkAndTriggerKeeper());
   }
 
+  double _calculateStandardPoints(Player p) {
+    double total = 0.0;
+    if (p.position == 'DST') {
+      total += (p.projSacks * 2.0);
+      total += (p.projTakeaways * 2.0);
+      total += (p.projDefTds * 6.0);
+      total += 24.0;
+      return total;
+    } else if (p.position == 'K') {
+      total += (p.projFgMade * 3.0);
+      total += (p.projFg50Plus * 2.0);
+      total += (p.projPatMade * 1.0);
+    } else {
+      total += (p.projPassYds * 0.04);
+      total += (p.projPassTds * 4.0);
+      total += (p.projPassInts * -2.0);
+      total += (p.projRushYds * 0.1);
+      total += (p.projRushTds * 6.0);
+      total += (p.projRecYds * 0.1);
+      total += (p.projRecTds * 6.0);
+    }
+    final riskMultiplier = (1.0 - (p.injuryRisk * 0.55 + p.crimeRisk * 0.45)).clamp(0.2, 1.0);
+    return total * riskMultiplier;
+  }
+
   double _calculateFantasyPoints(Player p) {
     double total = 0.0;
     const double games = 17.0;
@@ -571,9 +651,13 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
       total += (p.projSacks * _settings.sackPoints);
       total += (p.projTakeaways * _settings.intPoints);
       total += (p.projDefTds * _settings.defTdPoints);
-      total += (p.projPtsAllowedBaseline > 0
-          ? p.projPtsAllowedBaseline
-          : (_settings.pa4to6Points * games));
+      final double paPerGame = p.projPtsAllowedBaseline > 0 ? p.projPtsAllowedBaseline : 20.0;
+      double paSeasonPts = 18.0;
+      if (paPerGame <= 17.5) paSeasonPts = 34.0;
+      if (paPerGame <= 19.5) paSeasonPts = 26.0;
+      if (paPerGame <= 22.0) paSeasonPts = 20.0;
+      total += paSeasonPts;
+      return total;
     } else {
       final perGamePassYds = p.projPassYds / games;
       int passTiers = (perGamePassYds / 50.0).floor();
@@ -609,8 +693,8 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
       total += (p.projRec * recPerCatch);
     }
 
-    final injuryMultiplier = 1.0 - (p.injuryRisk * 0.5);
-    return total * injuryMultiplier * p.teamTalentScore;
+    final riskMultiplier = (1.0 - (p.injuryRisk * 0.55 + p.crimeRisk * 0.45)).clamp(0.2, 1.0);
+    return total * riskMultiplier * p.teamTalentScore;
   }
 
   double _getQuotaScarcityMultiplier(String pos) {
@@ -648,12 +732,6 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
     return 1.0 + (pressure * 0.4).clamp(0.0, 0.6);
   }
 
-  Color _getTierCliffColor(double vona) {
-    if (vona >= 20.0) return const Color(0xFFFF5252);
-    if (vona >= 8.0) return const Color(0xFFFFB74D);
-    return const Color(0xFF81C784);
-  }
-
   Color _getPositionBadgeColor(String position) {
     switch (position) {
       case 'QB':
@@ -670,6 +748,24 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
         return const Color(0xFF4E342E);
       default:
         return Colors.grey.shade700;
+    }
+  }
+
+  Color _getInjuryStatusColor(String status) {
+    switch (status.toUpperCase()) {
+      case 'OUT':
+      case 'IR':
+        return const Color(0xFFFF5252);
+      case 'D':
+      case 'DOUBTFUL':
+        return const Color(0xFFFF7043);
+      case 'Q':
+      case 'QUESTIONABLE':
+        return const Color(0xFFFFB74D);
+      case 'SUSP':
+        return const Color(0xFFAB47BC);
+      default:
+        return Colors.greenAccent;
     }
   }
 
@@ -1180,7 +1276,6 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
     DraftType tempDraftType = _settings.draftType;
     List<int> tempDraftOrder = List<int>.from(_settings.draftOrder);
 
-    // Roster Requirements Controllers
     final startQbCtrl = TextEditingController(text: _settings.startQb.toString());
     final startRbCtrl = TextEditingController(text: _settings.startRb.toString());
     final startWrCtrl = TextEditingController(text: _settings.startWr.toString());
@@ -1196,7 +1291,6 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
     final minKCtrl = TextEditingController(text: _settings.minK.toString());
     final minDstCtrl = TextEditingController(text: _settings.minDst.toString());
 
-    // Passing Controllers
     final passTdCtrl = TextEditingController(text: _settings.passTdPoints.toString());
     final passTd50Ctrl = TextEditingController(text: _settings.passTd50PlusBonus.toString());
     final passTd75Ctrl = TextEditingController(text: _settings.passTd75PlusBonus.toString());
@@ -1205,7 +1299,6 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
     final pass450Ctrl = TextEditingController(text: _settings.pass450Bonus.toString());
     final passIntCtrl = TextEditingController(text: _settings.passIntPoints.toString());
 
-    // Rushing Controllers
     final rushTdCtrl = TextEditingController(text: _settings.rushTdPoints.toString());
     final rushTd50Ctrl = TextEditingController(text: _settings.rushTd50PlusBonus.toString());
     final rushTd75Ctrl = TextEditingController(text: _settings.rushTd75PlusBonus.toString());
@@ -1214,7 +1307,6 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
     final rush200Ctrl = TextEditingController(text: _settings.rush200Bonus.toString());
     final rush300Ctrl = TextEditingController(text: _settings.rush300Bonus.toString());
 
-    // Receiving Controllers
     final recTdCtrl = TextEditingController(text: _settings.recTdPoints.toString());
     final recTd50Ctrl = TextEditingController(text: _settings.recTd50PlusBonus.toString());
     final recTd75Ctrl = TextEditingController(text: _settings.recTd75PlusBonus.toString());
@@ -1224,14 +1316,12 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
     final rec300Ctrl = TextEditingController(text: _settings.rec300Bonus.toString());
     final pprCtrl = TextEditingController(text: _settings.ppr.toString());
 
-    // Kicking Controllers
     final fgBaseCtrl = TextEditingController(text: _settings.fgBasePoints.toString());
     final fg40Ctrl = TextEditingController(text: _settings.fg40Bonus.toString());
     final fg50Ctrl = TextEditingController(text: _settings.fg50Bonus.toString());
     final fg60Ctrl = TextEditingController(text: _settings.fg60Bonus.toString());
     final xpCtrl = TextEditingController(text: _settings.xpPoints.toString());
 
-    // Defense Controllers
     final sackCtrl = TextEditingController(text: _settings.sackPoints.toString());
     final intCtrl = TextEditingController(text: _settings.intPoints.toString());
     final fumbleRecCtrl = TextEditingController(text: _settings.fumbleRecPoints.toString());
@@ -1440,10 +1530,6 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                             'Active Starting Lineup Configuration:',
                             style: TextStyle(fontWeight: FontWeight.bold, color: Colors.amberAccent),
                           ),
-                          const Text(
-                            'Higher starter counts directly inflate baseline VORP requirements for that position.',
-                            style: TextStyle(fontSize: 12, color: Colors.white60),
-                          ),
                           const SizedBox(height: 8),
                           _buildNumField('Starting Quarterbacks (QB)', startQbCtrl),
                           _buildNumField('Starting Running Backs (RB)', startRbCtrl),
@@ -1456,10 +1542,6 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                           const Text(
                             'Mandatory Positional Draft Quotas:',
                             style: TextStyle(fontWeight: FontWeight.bold, color: Colors.cyanAccent),
-                          ),
-                          const Text(
-                            'If your league requires drafting minimum position counts, the algorithm increases urgency to secure positions before late rounds.',
-                            style: TextStyle(fontSize: 12, color: Colors.white60),
                           ),
                           const SizedBox(height: 8),
                           _buildNumField('Must Draft QBs (e.g., 2)', minQbCtrl),
@@ -1898,6 +1980,11 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
   }
 
   Widget _buildOnTheClockHeader() {
+    final currentOpponent = _onTheClockTeamName;
+    final archetype = !_isMyTurn && !_isDraftComplete
+        ? _detectOpponentArchetype(currentOpponent)
+        : null;
+
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 10.0),
@@ -1918,7 +2005,9 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
           Row(
             children: [
               Icon(
-                _isDraftComplete ? Icons.flag : (_isMyTurn ? Icons.stars : Icons.timer_outlined),
+                _isDraftComplete
+                    ? Icons.flag
+                    : (_isMyTurn ? Icons.stars : Icons.timer_outlined),
                 color: _isDraftComplete
                     ? Colors.amberAccent
                     : (_isMyTurn ? Colors.greenAccent : Colors.purpleAccent),
@@ -1928,13 +2017,38 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
               Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    _isDraftComplete ? 'DRAFT COMPLETE' : 'ON THE CLOCK: $_onTheClockTeamName',
-                    style: TextStyle(
-                      fontSize: 14,
-                      fontWeight: FontWeight.bold,
-                      color: _isMyTurn ? Colors.greenAccent : Colors.white,
-                    ),
+                  Row(
+                    children: [
+                      Text(
+                        _isDraftComplete
+                            ? 'DRAFT COMPLETE'
+                            : 'ON THE CLOCK: $currentOpponent',
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.bold,
+                          color: _isMyTurn ? Colors.greenAccent : Colors.white,
+                        ),
+                      ),
+                      if (archetype != null && archetype != DrafterArchetype.balanced) ...[
+                        const SizedBox(width: 8),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: archetype.color.withValues(alpha: 0.2),
+                            borderRadius: BorderRadius.circular(4),
+                            border: Border.all(color: archetype.color, width: 1),
+                          ),
+                          child: Text(
+                            archetype.label,
+                            style: TextStyle(
+                              color: archetype.color,
+                              fontSize: 10,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ],
                   ),
                   Text(
                     _isDraftComplete
@@ -1955,7 +2069,11 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
               ),
               child: const Text(
                 'YOUR PICK',
-                style: TextStyle(color: Colors.black, fontSize: 11, fontWeight: FontWeight.bold),
+                style: TextStyle(
+                  color: Colors.black,
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
             ),
         ],
@@ -2058,8 +2176,17 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                   posGroups[key]!.sort((a, b) => b.value.compareTo(a.value));
                 }
 
-                // Positional Scarcity Calculation
                 final scarcityStatuses = _evaluateScarcity(posGroups);
+
+                // Scarcity bonus map for the Recommendation Engine
+                final Map<String, double> scarcityBonusMap = {};
+                for (final s in scarcityStatuses) {
+                  if (s.risk == ScarcityRisk.cliffDanger) {
+                    scarcityBonusMap[s.position] = 25.0; // Major urgency boost
+                  } else if (s.risk == ScarcityRisk.runDetected) {
+                    scarcityBonusMap[s.position] = 12.0;
+                  }
+                }
 
                 final flexPerPos = (_settings.startFlex * _settings.numTeams) / 2.0;
                 final Map<String, int> vorpBaselines = {
@@ -2093,6 +2220,7 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                   for (int i = 0; i < list.length; i++) {
                     final p = list[i].key;
                     final pts = list[i].value;
+                    final standardPts = _calculateStandardPoints(p);
                     final rawVorp = (pts - repPts).clamp(0.0, 999.0);
                     final vorp = rawVorp * scarcityMult;
 
@@ -2100,9 +2228,21 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                     final vona = (pts - nextPts).clamp(0.0, 999.0) * scarcityMult;
                     final alert = _evaluateValueAlert(p.adp);
 
+                    // Dynamic Recommendation Score
+                    double recScore = pts + (scarcityBonusMap[p.position] ?? 0.0);
+                    if (alert.level == ValueAlertLevel.valueDrop) {
+                      recScore += 20.0;
+                    } else if (alert.level == ValueAlertLevel.grabNow) {
+                      recScore += 30.0;
+                    } else if (alert.level == ValueAlertLevel.reachWarning) {
+                      recScore -= 25.0;
+                    }
+
                     ranked.add(RankedPlayer(
                       player: p,
-                      projPoints: pts,
+                      customProjPoints: pts,
+                      standardProjPoints: standardPts,
+                      recommendationScore: recScore,
                       vorp: vorp,
                       vona: vona,
                       valueAlert: alert,
@@ -2111,25 +2251,40 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                 }
 
                 switch (_selectedSort) {
+                  case SortMetric.recommended:
+                    ranked.sort((a, b) => b.recommendationScore.compareTo(a.recommendationScore));
+                    break;
+                  case SortMetric.customProj:
+                    ranked.sort((a, b) => b.customProjPoints.compareTo(a.customProjPoints));
+                    break;
+                  case SortMetric.standardProj:
+                    ranked.sort((a, b) => b.standardProjPoints.compareTo(a.standardProjPoints));
+                    break;
+                  case SortMetric.threeYearAvg:
+                    ranked.sort((a, b) => b.player.threeYearAvgPts.compareTo(a.player.threeYearAvgPts));
+                    break;
+                  case SortMetric.adp:
+                    ranked.sort((a, b) => a.player.adp.compareTo(b.player.adp));
+                    break;
                   case SortMetric.vorp:
                     ranked.sort((a, b) => b.vorp.compareTo(a.vorp));
                     break;
                   case SortMetric.vona:
                     ranked.sort((a, b) => b.vona.compareTo(a.vona));
                     break;
-                  case SortMetric.projPoints:
-                    ranked.sort((a, b) => b.projPoints.compareTo(a.projPoints));
-                    break;
                   case SortMetric.priorYear:
                     ranked.sort((a, b) => b.player.priorYearPts.compareTo(a.player.priorYearPts));
                     break;
-                  case SortMetric.adp:
-                    ranked.sort((a, b) => a.player.adp.compareTo(b.player.adp));
-                    break;
                 }
 
+                final searchQuery = _searchController.text.trim().toLowerCase();
                 final filtered = ranked.where((r) {
                   final p = r.player;
+                  if (searchQuery.isNotEmpty) {
+                    final matchesName = p.name.toLowerCase().contains(searchQuery);
+                    final matchesTeam = p.nflTeam.toLowerCase().contains(searchQuery);
+                    if (!matchesName && !matchesTeam) return false;
+                  }
                   if (_selectedPosition != 'ALL' && p.position != _selectedPosition) {
                     return false;
                   }
@@ -2147,8 +2302,36 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                     _buildOnTheClockHeader(),
                     _buildRecentPickTicker(),
                     _buildPositionalScarcityTracker(scarcityStatuses),
+
+                    // Persistent Instant Player Search Field
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16.0, 8.0, 16.0, 4.0),
+                      child: TextField(
+                        controller: _searchController,
+                        onChanged: (_) => setState(() {}),
+                        decoration: InputDecoration(
+                          hintText: 'Search player or team (e.g. Gibbs, Jacobs, Tyreek, BAL)...',
+                          prefixIcon: const Icon(Icons.search, color: Colors.white60, size: 20),
+                          suffixIcon: _searchController.text.isNotEmpty
+                              ? IconButton(
+                                  icon: const Icon(Icons.clear, size: 18),
+                                  onPressed: () {
+                                    _searchController.clear();
+                                    setState(() {});
+                                  },
+                                )
+                              : null,
+                          isDense: true,
+                          contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                          filled: true,
+                          fillColor: const Color(0xFF2C2220),
+                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none),
+                        ),
+                      ),
+                    ),
+
                     Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 6.0),
+                      padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 4.0),
                       child: Row(
                         children: [
                           Expanded(
@@ -2215,11 +2398,14 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                             value: _selectedSort,
                             dropdownColor: const Color(0xFF2C2220),
                             items: const [
+                              DropdownMenuItem(value: SortMetric.recommended, child: Text('Sort: Draft Recommendation', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.amberAccent))),
+                              DropdownMenuItem(value: SortMetric.customProj, child: Text('Sort: Custom League Proj', style: TextStyle(fontSize: 12))),
+                              DropdownMenuItem(value: SortMetric.standardProj, child: Text('Sort: Standard Scoring Proj', style: TextStyle(fontSize: 12))),
+                              DropdownMenuItem(value: SortMetric.threeYearAvg, child: Text('Sort: 3-Yr Avg Pts', style: TextStyle(fontSize: 12))),
+                              DropdownMenuItem(value: SortMetric.adp, child: Text('Sort: 2026 ESPN ADP', style: TextStyle(fontSize: 12))),
                               DropdownMenuItem(value: SortMetric.vorp, child: Text('Sort: VORP', style: TextStyle(fontSize: 12))),
                               DropdownMenuItem(value: SortMetric.vona, child: Text('Sort: VONA', style: TextStyle(fontSize: 12))),
-                              DropdownMenuItem(value: SortMetric.projPoints, child: Text('Sort: Proj Pts', style: TextStyle(fontSize: 12))),
-                              DropdownMenuItem(value: SortMetric.priorYear, child: Text('Sort: Last Year', style: TextStyle(fontSize: 12))),
-                              DropdownMenuItem(value: SortMetric.adp, child: Text('Sort: ADP', style: TextStyle(fontSize: 12))),
+                              DropdownMenuItem(value: SortMetric.priorYear, child: Text('Sort: Last Year Pts', style: TextStyle(fontSize: 12))),
                             ],
                             onChanged: (v) {
                               if (v != null) setState(() => _selectedSort = v);
@@ -2232,16 +2418,15 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                     Expanded(
                       child: ListView.separated(
                         itemCount: filtered.length,
-                        separatorBuilder: (_, __) =>
-                            const Divider(height: 1, color: Colors.white12),
+                        separatorBuilder: (_, __) => const Divider(height: 1, color: Colors.white12),
                         itemBuilder: (context, index) {
                           final item = filtered[index];
                           final p = item.player;
-                          final cliffColor = _getTierCliffColor(item.vona);
 
                           final isTarget = _targetPlayerIds.contains(p.id);
                           final isFaded = _fadePlayerIds.contains(p.id);
                           final alert = item.valueAlert;
+                          final statusColor = _getInjuryStatusColor(p.injuryStatus);
 
                           return ListTile(
                             tileColor: isTarget
@@ -2251,22 +2436,24 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                                     : null,
                             contentPadding: const EdgeInsets.symmetric(
                               horizontal: 16.0,
-                              vertical: 4.0,
+                              vertical: 6.0,
                             ),
                             leading: Stack(
                               children: [
                                 CircleAvatar(
-                                  backgroundColor: isFaded
-                                      ? Colors.grey.shade800
-                                      : _getPositionBadgeColor(p.position),
-                                  child: Text(
-                                    p.position,
-                                    style: TextStyle(
-                                      color: isFaded ? Colors.white38 : Colors.white,
-                                      fontWeight: FontWeight.bold,
-                                      fontSize: 12,
-                                    ),
-                                  ),
+                                  radius: 22,
+                                  backgroundColor: isFaded ? Colors.grey.shade800 : _getPositionBadgeColor(p.position),
+                                  backgroundImage: p.headshotUrl.isNotEmpty ? NetworkImage(p.headshotUrl) : null,
+                                  child: p.headshotUrl.isEmpty
+                                      ? Text(
+                                          p.position,
+                                          style: TextStyle(
+                                            color: isFaded ? Colors.white38 : Colors.white,
+                                            fontWeight: FontWeight.bold,
+                                            fontSize: 12,
+                                          ),
+                                        )
+                                      : null,
                                 ),
                                 if (isTarget)
                                   const Positioned(
@@ -2282,39 +2469,127 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                                   ),
                               ],
                             ),
-                            title: Row(
+                            title: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                Text(
-                                  '${p.name} (${p.nflTeam})',
-                                  style: TextStyle(
-                                    fontWeight: FontWeight.bold,
-                                    fontSize: 15,
-                                    color: isFaded ? Colors.white38 : (isTarget ? Colors.amberAccent : Colors.white),
-                                    decoration: isFaded ? TextDecoration.lineThrough : null,
-                                  ),
-                                ),
-                                const SizedBox(width: 8),
-                                Text(
-                                  'Age: ${p.age} • ADP: ${p.adp < 990 ? p.adp.toStringAsFixed(1) : "N/A"}',
-                                  style: TextStyle(fontSize: 12, color: isFaded ? Colors.white24 : Colors.white54),
-                                ),
-                                if (alert.level != ValueAlertLevel.normal && !isFaded) ...[
-                                  const SizedBox(width: 8),
-                                  Container(
-                                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                                    decoration: BoxDecoration(
-                                      color: alert.color.withValues(alpha: 0.18),
-                                      borderRadius: BorderRadius.circular(4),
-                                      border: Border.all(color: alert.color, width: 1),
-                                    ),
-                                    child: Text(
-                                      alert.label,
+                                Row(
+                                  children: [
+                                    Text(
+                                      '${p.name} (${p.nflTeam})',
                                       style: TextStyle(
-                                        color: alert.color,
-                                        fontSize: 10,
                                         fontWeight: FontWeight.bold,
+                                        fontSize: 15,
+                                        color: isFaded ? Colors.white38 : (isTarget ? Colors.amberAccent : Colors.white),
+                                        decoration: isFaded ? TextDecoration.lineThrough : null,
                                       ),
                                     ),
+                                    const SizedBox(width: 8),
+
+                                    // Depth Chart Slot Badge (e.g. WR1, RB2)
+                                    if (p.position != 'DST') ...[
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
+                                        decoration: BoxDecoration(
+                                          color: const Color(0xFF6750A4).withValues(alpha: 0.25),
+                                          borderRadius: BorderRadius.circular(4),
+                                          border: Border.all(color: const Color(0xFF6750A4), width: 1),
+                                        ),
+                                        child: Text(
+                                          '${p.position}${p.depthChartOrder}',
+                                          style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                    ],
+
+                                    // Injury Status Tag (Q, OUT, IR)
+                                    if (p.injuryStatus.toUpperCase() != 'ACTIVE') ...[
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
+                                        decoration: BoxDecoration(
+                                          color: statusColor.withValues(alpha: 0.2),
+                                          borderRadius: BorderRadius.circular(4),
+                                          border: Border.all(color: statusColor, width: 1),
+                                        ),
+                                        child: Text(
+                                          p.injuryStatus.toUpperCase(),
+                                          style: TextStyle(color: statusColor, fontSize: 10, fontWeight: FontWeight.bold),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                    ],
+
+                                    Text(
+                                      p.position == 'DST' ? 'D/ST Unit' : 'Age: ${p.age} • 2026 ADP: ${p.adp < 900 ? p.adp.toStringAsFixed(1) : "N/A"}',
+                                      style: TextStyle(fontSize: 12, color: isFaded ? Colors.white24 : Colors.white54),
+                                    ),
+
+                                    // Value Drop / Reach Badges
+                                    if (alert.level != ValueAlertLevel.normal && !isFaded) ...[
+                                      const SizedBox(width: 8),
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                        decoration: BoxDecoration(
+                                          color: alert.color.withValues(alpha: 0.18),
+                                          borderRadius: BorderRadius.circular(4),
+                                          border: Border.all(color: alert.color, width: 1),
+                                        ),
+                                        child: Text(
+                                          alert.label,
+                                          style: TextStyle(color: alert.color, fontSize: 10, fontWeight: FontWeight.bold),
+                                        ),
+                                      ),
+                                    ],
+                                  ],
+                                ),
+
+                                // Elevated Risk Badges (Player Only - Never D/ST)
+                                if (p.position != 'DST' && (p.injuryRisk > 0.05 || p.crimeRisk > 0.0)) ...[
+                                  const SizedBox(height: 3),
+                                  Row(
+                                    children: [
+                                      if (p.injuryRisk > 0.05)
+                                        Container(
+                                          margin: const EdgeInsets.only(right: 6),
+                                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                          decoration: BoxDecoration(
+                                            color: Colors.redAccent.withValues(alpha: 0.18),
+                                            borderRadius: BorderRadius.circular(4),
+                                            border: Border.all(color: Colors.redAccent, width: 1),
+                                          ),
+                                          child: Row(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              const Icon(Icons.health_and_safety, color: Colors.redAccent, size: 12),
+                                              const SizedBox(width: 3),
+                                              Text(
+                                                'INJ RISK: ${(p.injuryRisk * 100).toInt()}%',
+                                                style: const TextStyle(color: Colors.redAccent, fontSize: 10, fontWeight: FontWeight.bold),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      if (p.crimeRisk > 0.0)
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                          decoration: BoxDecoration(
+                                            color: Colors.amber.withValues(alpha: 0.18),
+                                            borderRadius: BorderRadius.circular(4),
+                                            border: Border.all(color: Colors.amber, width: 1),
+                                          ),
+                                          child: Row(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              const Icon(Icons.gavel, color: Colors.amberAccent, size: 12),
+                                              const SizedBox(width: 3),
+                                              Text(
+                                                'CRIME / OFF-FIELD: ${(p.crimeRisk * 100).toInt()}%',
+                                                style: const TextStyle(color: Colors.amberAccent, fontSize: 10, fontWeight: FontWeight.bold),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                    ],
                                   ),
                                 ],
                               ],
@@ -2322,62 +2597,74 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                             subtitle: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                const SizedBox(height: 2),
+                                const SizedBox(height: 4),
                                 Row(
                                   children: [
                                     Text(
-                                      'VORP: +${item.vorp.toStringAsFixed(1)} | ',
+                                      'League Proj: ${item.customProjPoints.toStringAsFixed(1)} pts',
                                       style: TextStyle(
-                                        color: isFaded
-                                            ? Colors.white24
-                                            : (_selectedSort == SortMetric.vorp ? Colors.greenAccent : Colors.white70),
-                                        fontWeight: _selectedSort == SortMetric.vorp ? FontWeight.bold : FontWeight.normal,
-                                      ),
-                                    ),
-                                    Container(
-                                      padding: const EdgeInsets.symmetric(
-                                        horizontal: 6.0,
-                                        vertical: 2.0,
-                                      ),
-                                      decoration: BoxDecoration(
-                                        color: cliffColor.withValues(alpha: isFaded ? 0.05 : 0.18),
-                                        borderRadius: BorderRadius.circular(4.0),
-                                        border: Border.all(
-                                          color: cliffColor.withValues(alpha: isFaded ? 0.2 : 0.6),
-                                          width: 1,
-                                        ),
-                                      ),
-                                      child: Text(
-                                        'VONA: +${item.vona.toStringAsFixed(1)}',
-                                        style: TextStyle(
-                                          color: isFaded ? cliffColor.withValues(alpha: 0.4) : cliffColor,
-                                          fontWeight: FontWeight.bold,
-                                          fontSize: 12,
-                                        ),
+                                        color: isFaded ? Colors.white24 : (_selectedSort == SortMetric.recommended || _selectedSort == SortMetric.customProj ? Colors.amberAccent : Colors.white),
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 13,
                                       ),
                                     ),
                                     Text(
-                                      ' | Proj: ${item.projPoints.toStringAsFixed(1)} pts',
+                                      ' | Standard: ${item.standardProjPoints.toStringAsFixed(1)} pts',
                                       style: TextStyle(
-                                        color: isFaded
-                                            ? Colors.white24
-                                            : (_selectedSort == SortMetric.projPoints ? Colors.amberAccent : Colors.white70),
-                                        fontWeight: _selectedSort == SortMetric.projPoints ? FontWeight.bold : FontWeight.normal,
+                                        color: isFaded ? Colors.white24 : (_selectedSort == SortMetric.standardProj ? Colors.greenAccent : Colors.white70),
+                                        fontSize: 12,
+                                        fontWeight: _selectedSort == SortMetric.standardProj ? FontWeight.bold : FontWeight.normal,
                                       ),
                                     ),
+                                    if (_selectedSort == SortMetric.recommended) ...[
+                                      const Spacer(),
+                                      Text(
+                                        'Rec Score: ${item.recommendationScore.toStringAsFixed(1)}',
+                                        style: const TextStyle(fontSize: 11, color: Colors.amberAccent, fontWeight: FontWeight.bold),
+                                      ),
+                                    ],
                                   ],
                                 ),
-                                const SizedBox(height: 2),
-                                Text(
-                                  'Last Year: ${p.priorYearPts > 0 ? "${p.priorYearPts.toStringAsFixed(1)} pts (${p.priorYearSummary})" : "Rookie / No prior data"}',
-                                  style: TextStyle(
-                                    fontSize: 11,
-                                    color: isFaded
-                                        ? Colors.white12
-                                        : (_selectedSort == SortMetric.priorYear ? Colors.cyanAccent : Colors.white38),
-                                    fontWeight: _selectedSort == SortMetric.priorYear ? FontWeight.bold : FontWeight.normal,
+                                const SizedBox(height: 3),
+
+                                // OLS Linear Regression Trend & Forecast
+                                if (p.position != 'DST' && p.regressionForecast > 0) ...[
+                                  Text(
+                                    'OLS Model Forecast: ${p.regressionForecast.toStringAsFixed(1)} pts (${p.trendSlope >= 0 ? "+" : ""}${p.trendSlope.toStringAsFixed(1)} YoY)',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      color: p.trendSlope > 15.0 ? Colors.greenAccent : (p.trendSlope < -15.0 ? Colors.redAccent : Colors.white60),
+                                      fontWeight: FontWeight.bold,
+                                    ),
                                   ),
-                                ),
+                                  const SizedBox(height: 2),
+                                ],
+
+                                // Multi-Year Stats Breakdown (2025, 2024, 2023)
+                                if (p.y2025Pts > 0 && p.y2025Stats.isNotEmpty)
+                                  Text(
+                                    '2025: ${p.y2025Stats} (${p.y2025Pts.toStringAsFixed(1)} pts)',
+                                    style: TextStyle(fontSize: 11, color: isFaded ? Colors.white12 : Colors.white70),
+                                  ),
+                                if (p.y2024Pts > 0 && p.y2024Stats.isNotEmpty)
+                                  Text(
+                                    '2024: ${p.y2024Stats} (${p.y2024Pts.toStringAsFixed(1)} pts)',
+                                    style: TextStyle(fontSize: 11, color: isFaded ? Colors.white12 : Colors.white60),
+                                  ),
+                                if (p.y2023Pts > 0 && p.y2023Stats.isNotEmpty)
+                                  Text(
+                                    '2023: ${p.y2023Stats} (${p.y2023Pts.toStringAsFixed(1)} pts)',
+                                    style: TextStyle(fontSize: 11, color: isFaded ? Colors.white12 : Colors.white54),
+                                  ),
+
+                                // 3-Year Actual Stat Averages
+                                if (p.threeYearStatsSummary.isNotEmpty) ...[
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    '3-Yr Stat Avg: ${p.threeYearStatsSummary}',
+                                    style: TextStyle(fontSize: 11, color: isFaded ? Colors.white12 : Colors.cyanAccent),
+                                  ),
+                                ],
                               ],
                             ),
                             trailing: Row(

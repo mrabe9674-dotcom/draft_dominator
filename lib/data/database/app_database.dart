@@ -13,16 +13,37 @@ class Players extends Table {
   TextColumn get nflTeam => text()();
   IntColumn get age => integer()();
 
-  // Draft tracking state
-  BoolColumn get isDrafted => boolean().withDefault(const Constant(false))();
+  // Status & Medical designation
+  TextColumn get injuryStatus => text().withDefault(const Constant('ACTIVE'))(); // ACTIVE, Q, OUT, IR, SUSP
 
-  // Risk & talent modifiers
-  RealColumn get injuryRisk => real().withDefault(const Constant(0.0))();
-  RealColumn get crimeRisk => real().withDefault(const Constant(0.0))();
-  RealColumn get teamTalentScore => real().withDefault(const Constant(1.0))();
+  // Draft state & consensus ADP
+  BoolColumn get isDrafted => boolean().withDefault(const Constant(false))();
   RealColumn get adp => real().withDefault(const Constant(999.0))();
 
-  // Passing / Rushing / Receiving (Skill positions)
+  // Quantified Risk Modifiers (0.0 to 1.0)
+  RealColumn get injuryRisk => real().withDefault(const Constant(0.05))();
+  RealColumn get crimeRisk => real().withDefault(const Constant(0.0))();
+  RealColumn get teamTalentScore => real().withDefault(const Constant(1.0))();
+
+  // Depth Chart, Headshot & OLS Linear Regression
+  IntColumn get depthChartOrder => integer().withDefault(const Constant(1))();
+  TextColumn get headshotUrl => text().withDefault(const Constant(''))();
+  RealColumn get trendSlope => real().withDefault(const Constant(0.0))();
+  RealColumn get regressionForecast => real().withDefault(const Constant(0.0))();
+
+  // Multi-Year Stat History (2025, 2024, 2023)
+  RealColumn get y2025Pts => real().withDefault(const Constant(0.0))();
+  TextColumn get y2025Stats => text().withDefault(const Constant(''))();
+  RealColumn get y2024Pts => real().withDefault(const Constant(0.0))();
+  TextColumn get y2024Stats => text().withDefault(const Constant(''))();
+  RealColumn get y2023Pts => real().withDefault(const Constant(0.0))();
+  TextColumn get y2023Stats => text().withDefault(const Constant(''))();
+
+  // 3-Year Actual Counting Stat Averages
+  RealColumn get threeYearAvgPts => real().withDefault(const Constant(0.0))();
+  TextColumn get threeYearStatsSummary => text().withDefault(const Constant(''))();
+
+  // Baseline Projections
   RealColumn get projPassYds => real().withDefault(const Constant(0.0))();
   RealColumn get projPassTds => real().withDefault(const Constant(0.0))();
   RealColumn get projPassInts => real().withDefault(const Constant(0.0))();
@@ -32,18 +53,18 @@ class Players extends Table {
   RealColumn get projRecYds => real().withDefault(const Constant(0.0))();
   RealColumn get projRecTds => real().withDefault(const Constant(0.0))();
 
-  // Kicking stats (ESPN standard metrics)
+  // Kicking stats
   RealColumn get projFgMade => real().withDefault(const Constant(0.0))();
   RealColumn get projFg50Plus => real().withDefault(const Constant(0.0))();
   RealColumn get projPatMade => real().withDefault(const Constant(0.0))();
 
-  // Defense / Special Teams stats (ESPN standard metrics)
+  // D/ST stats
   RealColumn get projSacks => real().withDefault(const Constant(0.0))();
   RealColumn get projTakeaways => real().withDefault(const Constant(0.0))();
   RealColumn get projDefTds => real().withDefault(const Constant(0.0))();
   RealColumn get projPtsAllowedBaseline => real().withDefault(const Constant(0.0))();
 
-  // Prior season stats
+  // Backward compatibility legacy columns
   RealColumn get priorYearPts => real().withDefault(const Constant(0.0))();
   TextColumn get priorYearSummary => text().withDefault(const Constant(''))();
 }
@@ -53,7 +74,7 @@ class AppDatabase extends _$AppDatabase {
   AppDatabase() : super(_openConnection());
 
   @override
-  int get schemaVersion => 4;
+  int get schemaVersion => 8;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
