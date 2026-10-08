@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
-import 'package:drift/drift.dart' as d;
+import 'package:drift/drift.dart' as drift;
 import 'data/database/app_database.dart';
-import 'domain/engine/draft_engine.dart';
 import 'services/cloud_sync_service.dart';
 
 void main() {
@@ -20,73 +19,107 @@ class DraftDominatorApp extends StatelessWidget {
       title: 'Draft Dominator',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: Colors.deepOrange,
-          brightness: Brightness.dark,
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: const Color(0xFF140D0C),
+        colorScheme: const ColorScheme.dark(
+          primary: Color(0xFF6750A4),
+          surface: Color(0xFF1E1716),
         ),
-        useMaterial3: true,
       ),
-      home: DraftHomeScreen(db: db),
+      home: DraftBoardPage(db: db),
     );
   }
 }
 
-class DraftHomeScreen extends StatefulWidget {
+class DraftBoardPage extends StatefulWidget {
   final AppDatabase db;
-  const DraftHomeScreen({super.key, required this.db});
+  const DraftBoardPage({super.key, required this.db});
 
   @override
-  State<DraftHomeScreen> createState() => _DraftHomeScreenState();
+  State<DraftBoardPage> createState() => _DraftBoardPageState();
 }
 
-class _DraftHomeScreenState extends State<DraftHomeScreen> {
-  late final CloudSyncService _syncService;
-  List<RankedPlayer> _rankedPlayers = [];
-  bool _isLoading = false;
+class RankedPlayer {
+  final Player player;
+  final double projPoints;
+  final double vorp;
+  final double vona;
 
-  // Mutable scoring and risk factors
-  double _ppr = 1.0;
-  double _injuryWeight = 0.5;
-  double _crimeWeight = 0.8;
-  double _teamWeight = 0.5;
+  RankedPlayer({
+    required this.player,
+    required this.projPoints,
+    required this.vorp,
+    required this.vona,
+  });
+}
+
+class _DraftBoardPageState extends State<DraftBoardPage> {
+  late final CloudSyncService _syncService;
+  final Set<int> _draftedPlayerIds = {};
+  String _selectedPosition = 'ALL';
+  bool _isLoading = false;
 
   @override
   void initState() {
     super.initState();
     _syncService = CloudSyncService(widget.db);
-    _refreshRankings();
+    _initializeData();
   }
 
-  LeagueSettings get _leagueSettings => LeagueSettings(ppr: _ppr);
-
-  CustomWeights get _customWeights => CustomWeights(
-        injuryWeight: _injuryWeight,
-        crimeWeight: _crimeWeight,
-        teamWeight: _teamWeight,
-      );
-
-  Future<void> _refreshRankings() async {
-    final all = await widget.db.select(widget.db.players).get();
-    final ranked = DraftEngine.calculateVorp(all, _leagueSettings, _customWeights);
-    setState(() => _rankedPlayers = ranked);
+  Future<void> _initializeData() async {
+    final count = await widget.db.select(widget.db.players).get();
+    if (count.isEmpty) {
+      await _sync();
+    }
   }
 
-  Future<void> _triggerSync() async {
+  Future<void> _sync() async {
     setState(() => _isLoading = true);
-    await _syncService.syncData();
-    await _refreshRankings();
-    setState(() => _isLoading = false);
+    try {
+      await _syncService.syncData();
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
   }
 
-  Future<void> _draftPlayer(Player p) async {
-    await (widget.db.update(widget.db.players)..where((tbl) => tbl.id.equals(p.id)))
-        .write(const PlayersCompanion(isDrafted: d.Value<bool>(true)));
-    await _refreshRankings();
+  void _resetDraft() {
+    setState(() {
+      _draftedPlayerIds.clear();
+    });
   }
 
-  Future<void> _resetDraft() async {
-    await widget.db.customUpdate('UPDATE players SET is_drafted = 0');
-    await _refreshRankings();
+  // Fantasy calculation baseline (Half-PPR scoring)
+  double _calculateFantasyPoints(Player p) {
+    final passPts = (p.projPassYds * 0.04) + (p.projPassTds * 4.0);
+    final rushPts = (p.projRushYds * 0.1) + (p.projRushTds * 6.0);
+    final recPts = (p.projRec * 0.5) + (p.projRecYds * 0.1) + (p.projRecTds * 6.0);
+    final basePts = passPts + rushPts + recPts;
+    
+    // Risk adjustments
+    final injuryMultiplier = 1.0 - (p.injuryRisk * 0.5);
+    return basePts * injuryMultiplier * p.teamTalentScore;
+  }
+
+  // Tier cliff color coding based on VONA drop-off to the next replacement tier
+  Color _getTierCliffColor(double vona) {
+    if (vona >= 20.0) return const Color(0xFFFF5252); // Critical cliff (Red): huge talent gap
+    if (vona >= 8.0) return const Color(0xFFFFB74D);  // Moderate drop (Orange/Amber)
+    return const Color(0xFF81C784);                   // Flat tier (Green): safe to wait
+  }
+
+  Color _getPositionBadgeColor(String position) {
+    switch (position) {
+      case 'QB':
+        return const Color(0xFF6A1B9A); // Deep Purple
+      case 'RB':
+        return const Color(0xFF1565C0); // Royal Blue
+      case 'WR':
+        return const Color(0xFF2E7D32); // Forest Green
+      case 'TE':
+        return const Color(0xFFD84315); // Rust Orange
+      default:
+        return Colors.grey.shade700;
+    }
   }
 
   @override
@@ -94,154 +127,228 @@ class _DraftHomeScreenState extends State<DraftHomeScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Draft Dominator (VORP Engine)'),
+        backgroundColor: Colors.transparent,
+        elevation: 0,
         actions: [
           IconButton(
             icon: const Icon(Icons.restart_alt),
-            tooltip: 'Reset Drafted Picks',
+            tooltip: 'Reset Drafted Players',
             onPressed: _resetDraft,
           ),
-          _isLoading
-              ? const Padding(
-                  padding: EdgeInsets.all(14.0),
-                  child: SizedBox(
-                    width: 20,
-                    height: 20,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                )
-              : IconButton(
-                  icon: const Icon(Icons.sync),
-                  tooltip: 'Sync Projections',
-                  onPressed: _triggerSync,
-                ),
-          Builder(
-            builder: (ctx) => IconButton(
-              icon: const Icon(Icons.tune),
-              tooltip: 'Risk & Scoring Settings',
-              onPressed: () => Scaffold.of(ctx).openEndDrawer(),
-            ),
+          IconButton(
+            icon: const Icon(Icons.sync),
+            tooltip: 'Sync Live Data',
+            onPressed: _sync,
           ),
         ],
       ),
-      endDrawer: Drawer(
-        child: SafeArea(
-          child: ListView(
-            padding: const EdgeInsets.all(16.0),
-            children: [
-              const Text(
-                'Scoring & Risk Sliders',
-                style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 20),
-              Text('League PPR: ${_ppr.toStringAsFixed(1)} pt'),
-              Slider(
-                value: _ppr,
-                min: 0.0,
-                max: 2.0,
-                divisions: 4,
-                label: '$_ppr PPR',
-                onChanged: (val) {
-                  setState(() => _ppr = val);
-                  _refreshRankings();
-                },
-              ),
-              const Divider(),
-              Text('Injury Fade Sensitivity: ${(_injuryWeight * 100).toInt()}%'),
-              Slider(
-                value: _injuryWeight,
-                min: 0.0,
-                max: 1.0,
-                divisions: 10,
-                label: '${(_injuryWeight * 100).toInt()}%',
-                onChanged: (val) {
-                  setState(() => _injuryWeight = val);
-                  _refreshRankings();
-                },
-              ),
-              const Divider(),
-              Text('Crime / Suspension Fade: ${(_crimeWeight * 100).toInt()}%'),
-              Slider(
-                value: _crimeWeight,
-                min: 0.0,
-                max: 1.0,
-                divisions: 10,
-                label: '${(_crimeWeight * 100).toInt()}%',
-                onChanged: (val) {
-                  setState(() => _crimeWeight = val);
-                  _refreshRankings();
-                },
-              ),
-              const Divider(),
-              Text('Offensive Talent Multiplier: ${(_teamWeight * 100).toInt()}%'),
-              Slider(
-                value: _teamWeight,
-                min: 0.0,
-                max: 1.0,
-                divisions: 10,
-                label: '${(_teamWeight * 100).toInt()}%',
-                onChanged: (val) {
-                  setState(() => _teamWeight = val);
-                  _refreshRankings();
-                },
-              ),
-            ],
-          ),
-        ),
-      ),
-      body: RefreshIndicator(
-        onRefresh: _triggerSync,
-        child: _rankedPlayers.isEmpty
-            ? Center(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    const Text('No undrafted players found in SQLite.'),
-                    const SizedBox(height: 12),
-                    ElevatedButton.icon(
-                      icon: const Icon(Icons.restart_alt),
-                      label: const Text('Reset Board'),
-                      onPressed: _resetDraft,
-                    )
-                  ],
-                ),
-              )
-            : ListView.separated(
-                physics: const AlwaysScrollableScrollPhysics(),
-                itemCount: _rankedPlayers.length,
-                separatorBuilder: (context, _) => const Divider(height: 1),
-                itemBuilder: (context, index) {
-                  final item = _rankedPlayers[index];
-                  final p = item.player;
+      body: _isLoading
+          ? const Center(child: CircularProgressIndicator())
+          : StreamBuilder<List<Player>>(
+              stream: widget.db.select(widget.db.players).watch(),
+              builder: (context, snapshot) {
+                if (!snapshot.hasData) {
+                  return const Center(child: CircularProgressIndicator());
+                }
 
-                  return ListTile(
-                    leading: CircleAvatar(
-                      backgroundColor: p.position == 'RB'
-                          ? Colors.blue.shade900
-                          : p.position == 'WR'
-                              ? Colors.green.shade900
-                              : p.position == 'TE'
-                                  ? Colors.amber.shade900
-                                  : Colors.purple.shade900,
-                      child: Text(
-                        p.position,
-                        style: const TextStyle(fontWeight: FontWeight.bold),
+                final allPlayers = snapshot.data!;
+                final availablePlayers = allPlayers
+                    .where((p) => !_draftedPlayerIds.contains(p.id))
+                    .toList();
+
+                // 1. Group available players by position and sort descending by points
+                final Map<String, List<MapEntry<Player, double>>> posGroups = {
+                  'QB': [],
+                  'RB': [],
+                  'WR': [],
+                  'TE': [],
+                };
+
+                for (final p in availablePlayers) {
+                  final pts = _calculateFantasyPoints(p);
+                  if (posGroups.containsKey(p.position)) {
+                    posGroups[p.position]!.add(MapEntry(p, pts));
+                  }
+                }
+
+                for (final key in posGroups.keys) {
+                  posGroups[key]!.sort((a, b) => b.value.compareTo(a.value));
+                }
+
+                // 2. Compute VORP and VONA baselines
+                // Baselines: 12-team single starter baseline (QB: 12th, RB: 24th, WR: 30th, TE: 12th)
+                const Map<String, int> vorpBaselines = {
+                  'QB': 12,
+                  'RB': 24,
+                  'WR': 30,
+                  'TE': 12,
+                };
+
+                final Map<String, double> replacementPoints = {};
+                for (final entry in vorpBaselines.entries) {
+                  final list = posGroups[entry.key] ?? [];
+                  if (list.isEmpty) {
+                    replacementPoints[entry.key] = 0.0;
+                  } else if (list.length >= entry.value) {
+                    replacementPoints[entry.key] = list[entry.value - 1].value;
+                  } else {
+                    replacementPoints[entry.key] = list.last.value;
+                  }
+                }
+
+                // 3. Assemble ranked roster
+                final List<RankedPlayer> ranked = [];
+                for (final entry in posGroups.entries) {
+                  final pos = entry.key;
+                  final list = entry.value;
+                  final repPts = replacementPoints[pos] ?? 0.0;
+
+                  for (int i = 0; i < list.length; i++) {
+                    final p = list[i].key;
+                    final pts = list[i].value;
+                    final vorp = (pts - repPts).clamp(0.0, 999.0);
+
+                    // VONA: Gap between this player and the next available player at this position
+                    final nextPts = (i + 1 < list.length) ? list[i + 1].value : repPts;
+                    final vona = (pts - nextPts).clamp(0.0, 999.0);
+
+                    ranked.add(RankedPlayer(
+                      player: p,
+                      projPoints: pts,
+                      vorp: vorp,
+                      vona: vona,
+                    ));
+                  }
+                }
+
+                // Sort overall draft board by VORP descending
+                ranked.sort((a, b) => b.vorp.compareTo(a.vorp));
+
+                // 4. Apply position filter
+                final filtered = _selectedPosition == 'ALL'
+                    ? ranked
+                    : ranked.where((r) => r.player.position == _selectedPosition).toList();
+
+                return Column(
+                  children: [
+                    // Position Filter Selector Bar
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+                      alignment: Alignment.centerLeft,
+                      child: SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        child: Row(
+                          children: ['ALL', 'QB', 'RB', 'WR', 'TE'].map((pos) {
+                            final isSelected = _selectedPosition == pos;
+                            return Padding(
+                              padding: const EdgeInsets.only(right: 8.0),
+                              child: ChoiceChip(
+                                label: Text(pos),
+                                selected: isSelected,
+                                selectedColor: const Color(0xFF6750A4),
+                                labelStyle: TextStyle(
+                                  color: isSelected ? Colors.white : Colors.white70,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                                onSelected: (_) {
+                                  setState(() {
+                                    _selectedPosition = pos;
+                                  });
+                                },
+                              ),
+                            );
+                          }).toList(),
+                        ),
                       ),
                     ),
-                    title: Text(
-                      '${p.name} (${p.nflTeam})',
-                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    const Divider(height: 1, color: Colors.white12),
+                    // Player Cards
+                    Expanded(
+                      child: ListView.separated(
+                        itemCount: filtered.length,
+                        separatorBuilder: (_, __) =>
+                            const Divider(height: 1, color: Colors.white12),
+                        itemBuilder: (context, index) {
+                          final item = filtered[index];
+                          final p = item.player;
+                          final cliffColor = _getTierCliffColor(item.vona);
+
+                          return ListTile(
+                            contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 16.0,
+                              vertical: 4.0,
+                            ),
+                            leading: CircleAvatar(
+                              backgroundColor: _getPositionBadgeColor(p.position),
+                              child: Text(
+                                p.position,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                            title: Text(
+                              '${p.name} (${p.nflTeam})',
+                              style: const TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 16,
+                              ),
+                            ),
+                            subtitle: Row(
+                              children: [
+                                Text(
+                                  'VORP: +${item.vorp.toStringAsFixed(1)} | ',
+                                  style: const TextStyle(color: Colors.white70),
+                                ),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 6.0,
+                                    vertical: 2.0,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: cliffColor.withOpacity(0.18),
+                                    borderRadius: BorderRadius.circular(4.0),
+                                    border: Border.all(
+                                      color: cliffColor.withOpacity(0.6),
+                                      width: 1,
+                                    ),
+                                  ),
+                                  child: Text(
+                                    'VONA: +${item.vona.toStringAsFixed(1)}',
+                                    style: TextStyle(
+                                      color: cliffColor,
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 12,
+                                    ),
+                                  ),
+                                ),
+                                Text(
+                                  ' | Proj: ${item.projPoints.toStringAsFixed(1)} pts | Age: ${p.age}',
+                                  style: const TextStyle(color: Colors.white70),
+                                ),
+                              ],
+                            ),
+                            trailing: ElevatedButton(
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: const Color(0xFF2C2220),
+                                foregroundColor: Colors.white70,
+                              ),
+                              onPressed: () {
+                                setState(() {
+                                  _draftedPlayerIds.add(p.id);
+                                });
+                              },
+                              child: const Text('Draft'),
+                            ),
+                          );
+                        },
+                      ),
                     ),
-                    subtitle: Text(
-                      'VORP: +${item.vorp.toStringAsFixed(1)} | VONA: +${item.vona.toStringAsFixed(1)} | Proj: ${item.adjustedPts.toStringAsFixed(1)} pts | Age: ${p.age}',
-                    ),
-                    trailing: ElevatedButton(
-                      child: const Text('Draft'),
-                      onPressed: () => _draftPlayer(p),
-                    ),
-                  );
-                },
-              ),
-      ),
+                  ],
+                );
+              },
+            ),
     );
   }
 }
