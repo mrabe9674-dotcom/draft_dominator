@@ -1,15 +1,22 @@
 import 'dart:math';
+import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:window_manager/window_manager.dart';
 import 'data/database/app_database.dart';
 import 'services/cloud_sync_service.dart';
 
-void main() {
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  if (Platform.isWindows) {
+    await windowManager.ensureInitialized();
+    windowManager.setTitle('On The Clock - Fantasy Football Draft Tool');
+  }
+
   final db = AppDatabase();
   runApp(OnTheClockApp(db: db));
 }
 
-// Compatibility alias so any lingering references never throw an error
 typedef DraftDominatorApp = OnTheClockApp;
 
 class OnTheClockApp extends StatelessWidget {
@@ -36,6 +43,24 @@ class OnTheClockApp extends StatelessWidget {
 
 enum DraftType { snake, linear }
 enum SortMetric { vorp, vona, projPoints, priorYear }
+
+enum ScarcityRisk { secure, runDetected, cliffDanger }
+
+class PositionalScarcityStatus {
+  final String position;
+  final int availableInCurrentTier;
+  final int opponentDemandBeforeNextPick;
+  final ScarcityRisk risk;
+  final String message;
+
+  PositionalScarcityStatus({
+    required this.position,
+    required this.availableInCurrentTier,
+    required this.opponentDemandBeforeNextPick,
+    required this.risk,
+    required this.message,
+  });
+}
 
 class KeeperSelection {
   final Player player;
@@ -335,6 +360,102 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
     if (_isDraftComplete) return false;
     final int teamIdx = _settings.getTeamIndexForPick(_currentPickNumber);
     return teamIdx == _settings.myTeamIndex;
+  }
+
+  int _calculatePicksUntilMyTurn() {
+    if (_isDraftComplete) return 0;
+    if (_isMyTurn) return 0;
+    final maxDraftPicks = _settings.numTeams * _settings.numRounds;
+    for (int p = _currentPickNumber + 1; p <= maxDraftPicks; p++) {
+      if (_settings.getTeamIndexForPick(p) == _settings.myTeamIndex) {
+        return p - _currentPickNumber;
+      }
+    }
+    return 0;
+  }
+
+  List<PositionalScarcityStatus> _evaluateScarcity(
+    Map<String, List<MapEntry<Player, double>>> posGroups,
+  ) {
+    if (_isDraftComplete) return [];
+
+    final int picksUntilMine = _isMyTurn ? 1 : _calculatePicksUntilMyTurn();
+    final int maxDraftPicks = _settings.numTeams * _settings.numRounds;
+
+    // Identify which opponent teams draft before our next turn
+    final Set<int> opponentTeamIndices = {};
+    for (int i = 0; i < picksUntilMine; i++) {
+      final pNum = _currentPickNumber + i;
+      if (pNum > maxDraftPicks) break;
+      final tIdx = _settings.getTeamIndexForPick(pNum);
+      if (tIdx != _settings.myTeamIndex) {
+        opponentTeamIndices.add(tIdx);
+      }
+    }
+
+    final List<PositionalScarcityStatus> statuses = [];
+
+    for (final pos in ['QB', 'RB', 'WR', 'TE']) {
+      final available = posGroups[pos] ?? [];
+      if (available.isEmpty) continue;
+
+      // Count opponents needing this position based on starting lineup
+      int neededByOpponents = 0;
+      for (final tIdx in opponentTeamIndices) {
+        final tName = _settings.teamNames[tIdx];
+        final draftedAtPos = _draftHistory
+            .where((p) => p.draftedByTeam == tName && p.player.position == pos)
+            .length;
+
+        int startersTarget = 1;
+        if (pos == 'QB') startersTarget = _settings.startQb;
+        if (pos == 'RB') startersTarget = _settings.startRb;
+        if (pos == 'WR') startersTarget = _settings.startWr;
+        if (pos == 'TE') startersTarget = _settings.startTe;
+
+        if (draftedAtPos < startersTarget) {
+          neededByOpponents++;
+        }
+      }
+
+      // Count players in the current highest tier (points within 15% of the leader)
+      final topPts = available.first.value;
+      int inTopTier = 0;
+      for (final entry in available) {
+        if ((topPts - entry.value) <= max(14.0, topPts * 0.14)) {
+          inTopTier++;
+        } else {
+          break;
+        }
+      }
+
+      // Evaluate recent run in the last 4 picks
+      final recentDraftedAtPos = _draftHistory.reversed
+          .take(4)
+          .where((pick) => pick.player.position == pos)
+          .length;
+
+      ScarcityRisk risk = ScarcityRisk.secure;
+      String message = '$inTopTier left in Tier';
+
+      if (inTopTier <= neededByOpponents || inTopTier <= 2) {
+        risk = ScarcityRisk.cliffDanger;
+        message = 'CLIFF ALERT: $inTopTier left in tier, $neededByOpponents teams drafting ahead need $pos';
+      } else if (recentDraftedAtPos >= 2 || inTopTier <= (neededByOpponents + 2)) {
+        risk = ScarcityRisk.runDetected;
+        message = 'RUN WARNING: $recentDraftedAtPos taken recently ($inTopTier tier-1 left)';
+      }
+
+      statuses.add(PositionalScarcityStatus(
+        position: pos,
+        availableInCurrentTier: inTopTier,
+        opponentDemandBeforeNextPick: neededByOpponents,
+        risk: risk,
+        message: message,
+      ));
+    }
+
+    return statuses;
   }
 
   void _checkAndTriggerKeeper() {
@@ -1628,6 +1749,92 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
     );
   }
 
+  Widget _buildPositionalScarcityTracker(List<PositionalScarcityStatus> statuses) {
+    if (statuses.isEmpty) return const SizedBox.shrink();
+
+    return Container(
+      color: const Color(0xFF1B1413),
+      padding: const EdgeInsets.symmetric(horizontal: 12.0, vertical: 6.0),
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Row(
+          children: [
+            const Row(
+              children: [
+                Icon(Icons.radar, color: Colors.cyanAccent, size: 16),
+                SizedBox(width: 6),
+                Text(
+                  'SCARCITY RADAR:',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.cyanAccent,
+                  ),
+                ),
+                SizedBox(width: 8),
+              ],
+            ),
+            ...statuses.map((status) {
+              Color bannerColor;
+              IconData bannerIcon;
+              Color textColor;
+
+              switch (status.risk) {
+                case ScarcityRisk.cliffDanger:
+                  bannerColor = const Color(0xFFFF5252).withValues(alpha: 0.2);
+                  bannerIcon = Icons.warning_amber_rounded;
+                  textColor = const Color(0xFFFF8A80);
+                  break;
+                case ScarcityRisk.runDetected:
+                  bannerColor = const Color(0xFFFFB74D).withValues(alpha: 0.2);
+                  bannerIcon = Icons.trending_up;
+                  textColor = const Color(0xFFFFCC80);
+                  break;
+                case ScarcityRisk.secure:
+                  bannerColor = const Color(0xFF81C784).withValues(alpha: 0.15);
+                  bannerIcon = Icons.check_circle_outline;
+                  textColor = const Color(0xFFA5D6A7);
+                  break;
+              }
+
+              return Container(
+                margin: const EdgeInsets.only(right: 8.0),
+                padding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 4.0),
+                decoration: BoxDecoration(
+                  color: bannerColor,
+                  borderRadius: BorderRadius.circular(6.0),
+                  border: Border.all(
+                    color: textColor.withValues(alpha: 0.5),
+                    width: 1,
+                  ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(bannerIcon, size: 14, color: textColor),
+                    const SizedBox(width: 5),
+                    Text(
+                      '${status.position}: ',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 11,
+                        color: textColor,
+                      ),
+                    ),
+                    Text(
+                      status.message,
+                      style: TextStyle(fontSize: 11, color: textColor),
+                    ),
+                  ],
+                ),
+              );
+            }),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildOnTheClockHeader() {
     return Container(
       width: double.infinity,
@@ -1789,6 +1996,9 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                   posGroups[key]!.sort((a, b) => b.value.compareTo(a.value));
                 }
 
+                // Positional Scarcity Calculation
+                final scarcityStatuses = _evaluateScarcity(posGroups);
+
                 final flexPerPos = (_settings.startFlex * _settings.numTeams) / 2.0;
                 final Map<String, int> vorpBaselines = {
                   'QB': max(1, _settings.startQb * _settings.numTeams),
@@ -1869,6 +2079,7 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                   children: [
                     _buildOnTheClockHeader(),
                     _buildRecentPickTicker(),
+                    _buildPositionalScarcityTracker(scarcityStatuses),
                     Container(
                       padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 6.0),
                       child: Row(
