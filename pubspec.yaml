@@ -1,0 +1,27 @@
+name: draft_dominator
+description: "Fantasy Draft Dominator cross-platform engine"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  drift: ^2.20.0
+  drift_flutter: ^0.2.0
+  http: ^1.2.2
+  csv: ^6.0.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  drift_dev: ^2.20.0
+  build_runner: ^2.4.9
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/data/
