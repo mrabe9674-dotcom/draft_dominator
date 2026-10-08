@@ -94,7 +94,7 @@ def generate_projections():
             "teamTalentScore": 1.15,
             "projPassYds": 0.0,
             "projPassTds": 0.0,
-            "projRushYds": 1250.0,
+            "projRushYds": 1800.0,
             "projRushTds": 11.0,
             "projRec": 65.0,
             "projRecYds": 540.0,
