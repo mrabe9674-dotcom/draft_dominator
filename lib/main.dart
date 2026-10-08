@@ -1,5 +1,5 @@
-import 'dart:math';
 import 'dart:io';
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:window_manager/window_manager.dart';
 import 'data/database/app_database.dart';
@@ -8,7 +8,7 @@ import 'services/cloud_sync_service.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  if (Platform.isWindows) {
+  if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
     await windowManager.ensureInitialized();
     windowManager.setTitle('On The Clock - Fantasy Football Draft Tool');
   }
@@ -42,9 +42,29 @@ class OnTheClockApp extends StatelessWidget {
 }
 
 enum DraftType { snake, linear }
-enum SortMetric { vorp, vona, projPoints, priorYear }
+enum SortMetric { vorp, vona, projPoints, priorYear, adp }
 
 enum ScarcityRisk { secure, runDetected, cliffDanger }
+
+enum ValueAlertLevel { normal, valueDrop, grabNow, reachWarning }
+
+class ValueAlert {
+  final ValueAlertLevel level;
+  final String label;
+  final Color color;
+
+  const ValueAlert({
+    required this.level,
+    required this.label,
+    required this.color,
+  });
+
+  static const normal = ValueAlert(
+    level: ValueAlertLevel.normal,
+    label: '',
+    color: Colors.transparent,
+  );
+}
 
 class PositionalScarcityStatus {
   final String position;
@@ -283,12 +303,14 @@ class RankedPlayer {
   final double projPoints;
   final double vorp;
   final double vona;
+  final ValueAlert valueAlert;
 
   RankedPlayer({
     required this.player,
     required this.projPoints,
     required this.vorp,
     required this.vona,
+    required this.valueAlert,
   });
 }
 
@@ -362,16 +384,60 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
     return teamIdx == _settings.myTeamIndex;
   }
 
+  int _calculateNextMyPickNumber() {
+    if (_isDraftComplete) return 999;
+    final maxDraftPicks = _settings.numTeams * _settings.numRounds;
+    final startSearch = _isMyTurn ? _currentPickNumber + 1 : _currentPickNumber;
+    for (int p = startSearch; p <= maxDraftPicks; p++) {
+      if (_settings.getTeamIndexForPick(p) == _settings.myTeamIndex) {
+        return p;
+      }
+    }
+    return maxDraftPicks + 1;
+  }
+
   int _calculatePicksUntilMyTurn() {
     if (_isDraftComplete) return 0;
     if (_isMyTurn) return 0;
-    final maxDraftPicks = _settings.numTeams * _settings.numRounds;
-    for (int p = _currentPickNumber + 1; p <= maxDraftPicks; p++) {
-      if (_settings.getTeamIndexForPick(p) == _settings.myTeamIndex) {
-        return p - _currentPickNumber;
-      }
+    final nextPick = _calculateNextMyPickNumber();
+    return max(0, nextPick - _currentPickNumber);
+  }
+
+  ValueAlert _evaluateValueAlert(double adp) {
+    if (adp >= 990.0) return ValueAlert.normal;
+
+    final currentPick = _currentPickNumber.toDouble();
+    final nextMyPick = _calculateNextMyPickNumber().toDouble();
+    final adpDiff = currentPick - adp;
+
+    // Major value drop: slipped 6+ picks past consensus ADP
+    if (adpDiff >= 6.0) {
+      return ValueAlert(
+        level: ValueAlertLevel.valueDrop,
+        label: '+${adpDiff.toInt()} VALUE DROP',
+        color: const Color(0xFF00E676),
+      );
     }
-    return 0;
+
+    // Must pick now: ADP indicates player won't survive until your next turn
+    if (adp >= currentPick && adp < nextMyPick && _isMyTurn) {
+      return const ValueAlert(
+        level: ValueAlertLevel.grabNow,
+        label: 'GRAB NOW',
+        color: Color(0xFFFF9100),
+      );
+    }
+
+    // Severe reach warning: reaching 12+ picks early when player projected to survive past next turn
+    if ((adp - currentPick) >= 12.0 && adp > nextMyPick && _isMyTurn) {
+      return const ValueAlert(
+        level: ValueAlertLevel.reachWarning,
+        label: 'REACH (CAN WAIT)',
+        color: Color(0xFFFF5252),
+      );
+    }
+
+    return ValueAlert.normal;
   }
 
   List<PositionalScarcityStatus> _evaluateScarcity(
@@ -382,7 +448,6 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
     final int picksUntilMine = _isMyTurn ? 1 : _calculatePicksUntilMyTurn();
     final int maxDraftPicks = _settings.numTeams * _settings.numRounds;
 
-    // Identify which opponent teams draft before our next turn
     final Set<int> opponentTeamIndices = {};
     for (int i = 0; i < picksUntilMine; i++) {
       final pNum = _currentPickNumber + i;
@@ -399,7 +464,6 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
       final available = posGroups[pos] ?? [];
       if (available.isEmpty) continue;
 
-      // Count opponents needing this position based on starting lineup
       int neededByOpponents = 0;
       for (final tIdx in opponentTeamIndices) {
         final tName = _settings.teamNames[tIdx];
@@ -418,7 +482,6 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
         }
       }
 
-      // Count players in the current highest tier (points within 15% of the leader)
       final topPts = available.first.value;
       int inTopTier = 0;
       for (final entry in available) {
@@ -429,21 +492,20 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
         }
       }
 
-      // Evaluate recent run in the last 4 picks
       final recentDraftedAtPos = _draftHistory.reversed
           .take(4)
           .where((pick) => pick.player.position == pos)
           .length;
 
       ScarcityRisk risk = ScarcityRisk.secure;
-      String message = '$inTopTier left in Tier';
+      String message = '$inTopTier in Tier';
 
       if (inTopTier <= neededByOpponents || inTopTier <= 2) {
         risk = ScarcityRisk.cliffDanger;
-        message = 'CLIFF ALERT: $inTopTier left in tier, $neededByOpponents teams drafting ahead need $pos';
+        message = 'CLIFF ALERT: $inTopTier left ($neededByOpponents teams need $pos)';
       } else if (recentDraftedAtPos >= 2 || inTopTier <= (neededByOpponents + 2)) {
         risk = ScarcityRisk.runDetected;
-        message = 'RUN WARNING: $recentDraftedAtPos taken recently ($inTopTier tier-1 left)';
+        message = 'RUN DETECTED: $recentDraftedAtPos recently drafted';
       }
 
       statuses.add(PositionalScarcityStatus(
@@ -2036,12 +2098,14 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
 
                     final nextPts = (i + 1 < list.length) ? list[i + 1].value : repPts;
                     final vona = (pts - nextPts).clamp(0.0, 999.0) * scarcityMult;
+                    final alert = _evaluateValueAlert(p.adp);
 
                     ranked.add(RankedPlayer(
                       player: p,
                       projPoints: pts,
                       vorp: vorp,
                       vona: vona,
+                      valueAlert: alert,
                     ));
                   }
                 }
@@ -2058,6 +2122,9 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                     break;
                   case SortMetric.priorYear:
                     ranked.sort((a, b) => b.player.priorYearPts.compareTo(a.player.priorYearPts));
+                    break;
+                  case SortMetric.adp:
+                    ranked.sort((a, b) => a.player.adp.compareTo(b.player.adp));
                     break;
                 }
 
@@ -2152,6 +2219,7 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                               DropdownMenuItem(value: SortMetric.vona, child: Text('Sort: VONA', style: TextStyle(fontSize: 12))),
                               DropdownMenuItem(value: SortMetric.projPoints, child: Text('Sort: Proj Pts', style: TextStyle(fontSize: 12))),
                               DropdownMenuItem(value: SortMetric.priorYear, child: Text('Sort: Last Year', style: TextStyle(fontSize: 12))),
+                              DropdownMenuItem(value: SortMetric.adp, child: Text('Sort: ADP', style: TextStyle(fontSize: 12))),
                             ],
                             onChanged: (v) {
                               if (v != null) setState(() => _selectedSort = v);
@@ -2173,6 +2241,7 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
 
                           final isTarget = _targetPlayerIds.contains(p.id);
                           final isFaded = _fadePlayerIds.contains(p.id);
+                          final alert = item.valueAlert;
 
                           return ListTile(
                             tileColor: isTarget
@@ -2226,9 +2295,28 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                                 ),
                                 const SizedBox(width: 8),
                                 Text(
-                                  'Age: ${p.age}',
+                                  'Age: ${p.age} • ADP: ${p.adp < 990 ? p.adp.toStringAsFixed(1) : "N/A"}',
                                   style: TextStyle(fontSize: 12, color: isFaded ? Colors.white24 : Colors.white54),
                                 ),
+                                if (alert.level != ValueAlertLevel.normal && !isFaded) ...[
+                                  const SizedBox(width: 8),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                    decoration: BoxDecoration(
+                                      color: alert.color.withValues(alpha: 0.18),
+                                      borderRadius: BorderRadius.circular(4),
+                                      border: Border.all(color: alert.color, width: 1),
+                                    ),
+                                    child: Text(
+                                      alert.label,
+                                      style: TextStyle(
+                                        color: alert.color,
+                                        fontSize: 10,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                  ),
+                                ],
                               ],
                             ),
                             subtitle: Column(
