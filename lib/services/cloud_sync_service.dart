@@ -1,22 +1,31 @@
 import 'dart:convert';
-import 'package:http/http.dart' as http;
 import 'package:flutter/services.dart' show rootBundle;
+import 'package:http/http.dart' as http;
 import 'package:drift/drift.dart';
 import '../data/database/app_database.dart';
 
 class CloudSyncService {
   final AppDatabase db;
   static const String remoteUrl =
-      'https://raw.githubusercontent.com/mrabe9674-dotcom/draft_dominator/assets/data/players.json';
+      'https://raw.githubusercontent.com/mrabe9674-dotcom/draft_dominator/main/assets/data/players.json';
 
   CloudSyncService(this.db);
 
   Future<void> syncData() async {
     String rawData;
     try {
-      final res =
-          await http.get(Uri.parse(remoteUrl)).timeout(const Duration(seconds: 4));
-      rawData = (res.statusCode == 200) ? res.body : throw Exception();
+      // Append millisecond timestamp to bypass GitHub's raw CDN caching
+      final cacheBusterUrl =
+          '$remoteUrl?t=${DateTime.now().millisecondsSinceEpoch}';
+      final res = await http
+          .get(Uri.parse(cacheBusterUrl))
+          .timeout(const Duration(seconds: 4));
+
+      if (res.statusCode == 200) {
+        rawData = res.body;
+      } else {
+        throw Exception('Server returned status ${res.statusCode}');
+      }
     } catch (_) {
       rawData = await rootBundle.loadString('assets/data/players.json');
     }
@@ -42,9 +51,7 @@ class CloudSyncService {
       );
     }).toList();
 
-    // Clear stale rows first to prevent duplicate stacking across syncs
     await db.delete(db.players).go();
-
     await db.batch((b) {
       b.insertAll(db.players, companions);
     });
