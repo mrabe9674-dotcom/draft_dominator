@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:drift/drift.dart' as drift;
 import 'data/database/app_database.dart';
 import 'services/cloud_sync_service.dart';
 
@@ -88,21 +87,20 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
     });
   }
 
-  // Fantasy calculation baseline (Half-PPR scoring)
+  // Fantasy scoring baseline (Half-PPR with injury/risk multiplier)
   double _calculateFantasyPoints(Player p) {
     final passPts = (p.projPassYds * 0.04) + (p.projPassTds * 4.0);
     final rushPts = (p.projRushYds * 0.1) + (p.projRushTds * 6.0);
     final recPts = (p.projRec * 0.5) + (p.projRecYds * 0.1) + (p.projRecTds * 6.0);
     final basePts = passPts + rushPts + recPts;
-    
-    // Risk adjustments
+
     final injuryMultiplier = 1.0 - (p.injuryRisk * 0.5);
     return basePts * injuryMultiplier * p.teamTalentScore;
   }
 
   // Tier cliff color coding based on VONA drop-off to the next replacement tier
   Color _getTierCliffColor(double vona) {
-    if (vona >= 20.0) return const Color(0xFFFF5252); // Critical cliff (Red): huge talent gap
+    if (vona >= 20.0) return const Color(0xFFFF5252); // Critical cliff (Red): large talent drop
     if (vona >= 8.0) return const Color(0xFFFFB74D);  // Moderate drop (Orange/Amber)
     return const Color(0xFF81C784);                   // Flat tier (Green): safe to wait
   }
@@ -176,7 +174,7 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                 }
 
                 // 2. Compute VORP and VONA baselines
-                // Baselines: 12-team single starter baseline (QB: 12th, RB: 24th, WR: 30th, TE: 12th)
+                // 12-team baseline: QB: 12th, RB: 24th, WR: 30th, TE: 12th
                 const Map<String, int> vorpBaselines = {
                   'QB': 12,
                   'RB': 24,
@@ -262,7 +260,7 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                       ),
                     ),
                     const Divider(height: 1, color: Colors.white12),
-                    // Player Cards
+                    // Player List
                     Expanded(
                       child: ListView.separated(
                         itemCount: filtered.length,
@@ -307,10 +305,10 @@ class _DraftBoardPageState extends State<DraftBoardPage> {
                                     vertical: 2.0,
                                   ),
                                   decoration: BoxDecoration(
-                                    color: cliffColor.withOpacity(0.18),
+                                    color: cliffColor.withValues(alpha: 0.18),
                                     borderRadius: BorderRadius.circular(4.0),
                                     border: Border.all(
-                                      color: cliffColor.withOpacity(0.6),
+                                      color: cliffColor.withValues(alpha: 0.6),
                                       width: 1,
                                     ),
                                   ),
