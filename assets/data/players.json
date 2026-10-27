@@ -132,7 +132,7 @@
     "position": "WR",
     "nflTeam": "DET",
     "age": 27,
-    "injuryRisk": 0.0,
+    "injuryRisk": 0.25,
     "crimeRisk": 0.0,
     "teamTalentScore": 1.0,
     "projPassYds": 0.0,
